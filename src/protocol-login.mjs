@@ -706,7 +706,7 @@ async function runUniformPassword(args, { chatgptBase, authBase, transport }) {
       phase = "建立密码设置会话";
       await client.follow(`${chatgptBase}/`, { referer: `${chatgptBase}/` });
     }
-    console.log("[password-set] 进入邮箱验证改密流程，已保留本次输入的统一新密码。");
+    console.log("[password-set] 正在验证账号并设置新密码，已保留本次输入的统一新密码。");
     const deviceId = web?.deviceId || client.jar.value("oai-did", `${chatgptBase}/`) || crypto.randomUUID();
     phase = "验证账号并设置新密码";
     await setAccountPassword(client, {
@@ -722,7 +722,7 @@ async function runUniformPassword(args, { chatgptBase, authBase, transport }) {
           return await verifyPassword(accountClient, { authBase, rl, deviceId, password: currentPassword, referer, interactive: false });
         } catch (error) {
           if (!isRejectedPasswordError(error)) throw error;
-          console.log("[password-set] 已保存的原密码被拒绝，尝试平台提供的邮箱验证码方式。");
+          console.log("[password-set] 已保存的原密码被拒绝。");
           return null;
         }
       },
@@ -1268,6 +1268,9 @@ async function verifyPassword(client, { authBase, rl, deviceId, password, refere
         authBase,
         deviceId,
         flow: "password_verify",
+      }).catch((error) => {
+        error.passwordSetPublicMessage = "获取原密码验证所需的平台安全令牌失败：本次原密码验证请求尚未发送，不能据此判断原密码是否正确。请在官方网页完成账号验证或修改密码";
+        throw error;
       });
       const { data } = await authJsonStep(client, authBase, "POST", "/api/accounts/password/verify", {
         password: value,

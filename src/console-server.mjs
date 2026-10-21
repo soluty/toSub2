@@ -842,7 +842,9 @@ function scheduleQueuedJobs() {
 
 async function prepareAndLaunchJob(job, mode, queueRunId) {
   try {
-    if (["full", "totp_setup", "password_add", "password_set", "logout_all"].includes(mode) && job.mailApiUrl) await loadMailboxBaseline(job);
+    const needsMailboxBaseline = ["full", "totp_setup", "password_add", "logout_all"].includes(mode)
+      || (mode === "password_set" && !job.password && !job.hasPasswordCredential);
+    if (needsMailboxBaseline && job.mailApiUrl) await loadMailboxBaseline(job);
     if (!isActive(job.status) || job.status === "queued" || job.queueRunId !== queueRunId) return;
     launchJob(job, { mode });
   } catch (error) {

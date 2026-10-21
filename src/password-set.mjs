@@ -122,6 +122,9 @@ async function openPasswordPage(client, options, mode, markPhase) {
         markPhase("验证账号原密码");
         verified = await verifyCurrentPassword?.(client, page.finalUrl);
         if (!verified) {
+          if (mode === "reset") {
+            throw flowError("PASSWORD_SET_OLD_PASSWORD_REQUIRED", "平台要求验证账号原密码，但本机原密码缺失或已被拒绝。请重新导入正确的原密码后再修改；不要在这里填写统一新密码");
+          }
           const html = page.last?.text || "";
           const offered = /passwordless_login_send_otp|\/passwordless\/send-otp|passwordless_disabled[\\"'\s,:]*false|Use a one.time code|使用一次性验证码/i.test(html);
           if (!offered) throw flowError("PASSWORD_SET_OLD_PASSWORD_REQUIRED", "平台要求验证账号原密码，但本机没有可用原密码，且页面未提供邮箱验证码方式。请重新导入原账号密码后再试；不要在这里填写统一新密码");
@@ -142,9 +145,12 @@ async function openPasswordPage(client, options, mode, markPhase) {
           continue;
         }
       } else if (current.pathname === "/email-verification") {
+        if (mode === "reset") {
+          throw flowError("PASSWORD_SET_UNEXPECTED_EMAIL_VERIFICATION", "修改密码时平台返回了额外邮箱验证，当前改密流程无法继续。请在官方页面完成身份验证后重试");
+        }
         markPhase("验证邮箱验证码");
         console.log(`[email-otp-requested-at] ${requestedAt}`);
-        console.log("[password-set] 请完成设置新密码所需的邮箱验证。");
+        console.log("[password-set] 请完成添加密码所需的邮箱验证。");
         verified = await verifyEmail(client, page.finalUrl);
       } else {
         throw flowError("PASSWORD_SET_VALIDATION", "平台要求额外身份验证，当前流程尚未进入新密码页面，请先在官方页面完成验证");

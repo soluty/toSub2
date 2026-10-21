@@ -20,6 +20,8 @@ const mutations = [];
 const modes = [];
 const passwordChecks = [];
 const pageRequests = new Map();
+const mailboxRequests = [];
+const emailOtpRequests = [];
 const serving = process.argv.includes("--serve");
 let upstreamBase;
 let child;
@@ -35,6 +37,10 @@ const upstream = http.createServer(async (req, res) => {
   const name = cookies.account;
   const mode = cookies.mode;
   const json = (status, data) => res.writeHead(status, { "content-type": "application/json" }).end(JSON.stringify(data));
+  if (url.pathname.startsWith("/mail/")) {
+    mailboxRequests.push(url.pathname);
+    return json(200, []);
+  }
   if (url.pathname === "/") {
     res.setHeader("set-cookie", "__Host-next-auth.csrf-token=test-csrf; Path=/");
     return res.end("<html>测试登录</html>");
@@ -48,16 +54,17 @@ const upstream = http.createServer(async (req, res) => {
     modes.push({ account, mode: nextMode });
     res.setHeader("set-cookie", [`account=${account}; Path=/`, `mode=${nextMode}; Path=/`]);
     if (["network", "flaky", "http-error"].includes(account)) return json(200, { url: `${upstreamBase}/api/accounts/authorize?state=private-state&code=private-code` });
-    if (["otp-only", "stored", "rejected", "blocked"].includes(account) || (account === "lost" && nextMode === "login")) {
+    if (["lost", "otp-only", "stored", "mfa", "cancel", "rejected", "blocked"].includes(account)) {
       return json(200, { url: `${upstreamBase}/log-in/password` });
     }
+    if (nextMode === "reset" && account !== "unexpected-email") return json(200, { url: `${upstreamBase}/reset-password/new-password` });
     return json(200, { url: `${upstreamBase}/email-verification` });
   }
   if (url.pathname === "/api/accounts/authorize") {
     pageRequests.set(name, (pageRequests.get(name) || 0) + 1);
     if (name === "http-error") return json(503, { error: { message: `${newPassword} private-token` } });
     if (name === "network" || (name === "flaky" && pageRequests.get(name) === 1)) return res.destroy();
-    return res.writeHead(302, { location: `${upstreamBase}/email-verification` }).end();
+    return res.writeHead(302, { location: `${upstreamBase}/reset-password/new-password` }).end();
   }
   if (url.pathname === "/log-in/password") return res.end(`<html><input type="password" name="password">${["otp-only", "rejected"].includes(name)
     ? '<button name="intent" value="passwordless_login_send_otp">Use a one-time code</button>' : ""}</html>`);
@@ -65,18 +72,20 @@ const upstream = http.createServer(async (req, res) => {
     const password = JSON.parse(body).password;
     passwordChecks.push({ name, password });
     if (password !== accounts.get(name)) return json(401, { error: { message: `invalid_password ${password}` } });
-    return json(200, { continue_url: `${upstreamBase}/email-verification` });
+    if (["mfa", "cancel"].includes(name)) return json(200, { page: { type: "mfa_challenge" }, continue_url: `${upstreamBase}/mfa-challenge/test-factor`,
+      "oai-client-auth-session": { mfa_factors: [{ factor_type: "totp", id: "test-factor" }] } });
+    return json(200, { continue_url: `${upstreamBase}/reset-password/new-password`, page: { type: "reset_password_new_password" } });
   }
   if (url.pathname === "/api/accounts/passwordless/send-otp") {
+    emailOtpRequests.push({ name, mode, action: "send" });
     assert(["otp-only", "rejected"].includes(name));
     assert.equal(req.method, "POST");
     return json(200, { continue_url: `${upstreamBase}/email-verification` });
   }
   if (url.pathname === "/email-verification") return res.end("<html>邮箱验证码</html>");
   if (url.pathname === "/api/accounts/email-otp/validate") {
+    emailOtpRequests.push({ name, mode, action: "validate" });
     assert.equal(JSON.parse(body).code, "123456");
-    if (name === "lost") return json(200, { page: { type: "mfa_challenge" }, continue_url: `${upstreamBase}/mfa-challenge/test-factor`,
-      "oai-client-auth-session": { mfa_factors: [{ factor_type: "totp", id: "test-factor" }] } });
     return json(200, { continue_url: `${upstreamBase}/${mode === "login" ? "web-callback" : "reset-password/new-password"}`,
       page: { type: mode === "login" ? "external_url" : "reset_password_new_password" } });
   }
@@ -110,13 +119,10 @@ try {
   }
   accounts.set("untracked", oldPassword);
   if (!serving) {
-    for (const name of ["lost", "otp-only", "stored", "rejected", "blocked", "network", "flaky", "http-error"]) {
+    for (const name of ["lost", "otp-only", "stored", "mfa", "cancel", "rejected", "blocked", "unexpected-email", "network", "flaky", "http-error"]) {
       await fixture(name, true);
-      if (!["stored", "rejected"].includes(name)) await fs.rm(path.join(fixtures.get(name).directory, "password-add-result.json"));
+      if (!["stored", "mfa", "cancel", "rejected"].includes(name)) await fs.rm(path.join(fixtures.get(name).directory, "password-add-result.json"));
     }
-    const lostMetadataPath = path.join(fixtures.get("lost").directory, "job-meta.json");
-    const lostMetadata = JSON.parse(await fs.readFile(lostMetadataPath, "utf8"));
-    await fs.writeFile(lostMetadataPath, JSON.stringify({ ...lostMetadata, has_totp_key: true }));
     accounts.set("rejected", "Actual_Old_Password_928!");
     for (const [name, state] of [["pending", "preparing"], ["recovered", "completed"]]) {
       await fixture(name, false);
@@ -188,22 +194,24 @@ try {
     selected.forEach(name => assert(exported.includes(`${name}@example.com----${newPassword}`)));
     assert.equal((await request("/api/jobs/add-password-batch", { ids })).status, 409, "新功能成功后原功能仍按已有密码规则跳过");
 
-    const regressionNames = ["lost", "otp-only", "stored", "rejected", "flaky"];
+    const regressionNames = ["stored", "mfa", "flaky"];
     await request("/api/jobs/set-password-batch", { ids: regressionNames.map(name => fixtures.get(name).id), password: newPassword });
     await complete(regressionNames, job => job.passwordSetState === "completed");
     regressionNames.forEach(name => assert.equal(accounts.get(name), newPassword));
     assert(modes.filter(item => regressionNames.includes(item.account)).every(item => item.mode === "reset"), "统一改密不应先发起普通密码登录");
-    assert.deepEqual(passwordChecks.map(item => item.name).sort(), ["rejected", "stored"]);
+    assert.deepEqual(passwordChecks.map(item => item.name).sort(), ["mfa", "stored"]);
     assert(passwordChecks.every(item => item.password === oldPassword), "目标新密码不能被当作登录原密码");
-    const lostLogs = await (await request(`/api/jobs/${fixtures.get("lost").id}/logs`)).json();
-    assert(!lostLogs.logs.includes("Password (q=quit):"));
-    assert(lostLogs.logs.includes("2FA"), "不能跳过平台要求的 2FA 验证");
+    const mfaLogs = await (await request(`/api/jobs/${fixtures.get("mfa").id}/logs`)).json();
+    assert(!mfaLogs.logs.includes("Password (q=quit):"));
+    assert(mfaLogs.logs.includes("2FA"), "不能跳过平台要求的 2FA 验证");
+    assert(!mfaLogs.logs.includes("Email OTP (r=resend, q=quit):"));
     assert.equal(pageRequests.get("flaky"), 2, "验证页网络中断只重试一次");
-    for (const name of ["blocked", "network", "http-error"]) {
+    for (const name of ["lost", "otp-only", "rejected", "blocked", "unexpected-email", "network", "http-error"]) {
       await request("/api/jobs/set-password-batch", { ids: [fixtures.get(name).id], password: newPassword });
       await complete([name], job => job.passwordSetState === "failed");
       const job = await getJob(name);
-      if (name === "blocked") assert.match(job.passwordSetError, /原密码.*重新导入/);
+      if (["lost", "otp-only", "rejected", "blocked"].includes(name)) assert.match(job.passwordSetError, /原密码.*重新导入/);
+      else if (name === "unexpected-email") assert.match(job.passwordSetError, /额外邮箱验证.*官方页面/);
       else {
         assert.match(job.passwordSetError, /打开密码验证页面失败/);
         assert.match(job.passwordSetError, /\/api\/accounts\/authorize/);
@@ -214,15 +222,16 @@ try {
       assert(!job.passwordSetError.includes("private-code"));
       assert(!job.passwordSetError.includes(newPassword));
       assert.equal(mutations.filter(item => item.name === name).length, 0);
+      assert.equal(accounts.get(name), name === "rejected" ? "Actual_Old_Password_928!" : oldPassword);
     }
 
-    const existingId = fixtures.get("existing").id;
+    const cancelId = fixtures.get("cancel").id;
     const countBeforeCancel = mutations.length;
-    await request("/api/jobs/set-password-batch", { ids: [existingId], password: "Canceled_Password_927!" });
-    await until(async () => (await getJob("existing")).status === "email_otp");
-    await request(`/api/jobs/${existingId}/cancel`, {});
-    assert.equal((await getJob("existing")).passwordSetState, "failed");
-    assert.equal(accounts.get("existing"), newPassword);
+    await request("/api/jobs/set-password-batch", { ids: [cancelId], password: "Canceled_Password_927!" });
+    await until(async () => (await getJob("cancel")).status === "mfa_otp");
+    await request(`/api/jobs/${cancelId}/cancel`, {});
+    assert.equal((await getJob("cancel")).passwordSetState, "failed");
+    assert.equal(accounts.get("cancel"), oldPassword);
     assert.equal(mutations.length, countBeforeCancel, "验证阶段取消不应提交新密码");
 
     for (const [name, state] of [["denied", "failed"], ["uncertain", "unknown"]]) {
@@ -251,7 +260,12 @@ try {
     assert.equal((await getJob("uncertain")).passwordSetState, "unknown");
     assert.equal((await getJob("uncertain")).autoRepairEligible, false);
     assert.equal(mutations.filter(item => item.name === "uncertain").length, 1);
-    console.log("统一密码测试通过：原批量添加保持随机密码及跳过规则；新功能覆盖添加、改密、已存在密码回退、失败保护、重启恢复与脱敏");
+    assert.equal(mailboxRequests.length, 0, "已配置邮箱收码接口的改密任务也不应读取邮箱");
+    assert.equal(emailOtpRequests.filter(item => item.mode === "reset").length, 0, "改密不能发送或验证邮箱验证码");
+    assert(emailOtpRequests.some(item => item.mode === "add"), "添加密码仍应完成平台要求的邮箱验证");
+    assert.deepEqual(passwordChecks.map(item => item.name).sort(), ["cancel", "mfa", "rejected", "stored"]);
+    assert(passwordChecks.every(item => item.password === oldPassword));
+    console.log("统一密码测试通过：改密不读取邮箱、不等待邮箱验证码，保留原密码和 2FA 验证；覆盖添加、失败保护、取消、重启恢复与脱敏");
   }
 } finally {
   await stop();
@@ -265,7 +279,8 @@ async function fixture(name, hasPassword) {
   const directory = path.join(root, id);
   await fs.mkdir(directory);
   await fs.writeFile(path.join(directory, "sub2api-import-oauth.json"), JSON.stringify({ type: "sub2api-data", accounts: [{ credentials: { email: `${name}@example.com` } }] }));
-  await fs.writeFile(path.join(directory, "job-meta.json"), JSON.stringify({ email: `${name}@example.com`, status: "completed", has_password: hasPassword, login_mode: hasPassword ? "password" : "email_otp" }));
+  await fs.writeFile(path.join(directory, "job-meta.json"), JSON.stringify({ email: `${name}@example.com`, status: "completed", has_password: hasPassword,
+    login_mode: hasPassword ? "password" : "email_otp", mail_api_url: hasPassword ? `${upstreamBase}/mail/${name}` : null }));
   if (hasPassword) {
     accounts.set(name, oldPassword);
     await fs.writeFile(path.join(directory, "password-add-result.json"), JSON.stringify({ version: 1, email: `${name}@example.com`, password: oldPassword, added_at: new Date().toISOString() }), { mode: 0o600 });
@@ -298,7 +313,7 @@ function request(route, body) {
   return fetch(base + route, { method: body === undefined ? "GET" : "POST", headers, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
 }
 async function getJob(name) {
-  const data = await (await request("/api/jobs")).json();
+  const data = await (await request("/api/jobs/query", { emails: [`${name}@example.com`] })).json();
   return data.jobs.find(job => job.id === fixtures.get(name).id);
 }
 async function complete(names, done) {
@@ -308,6 +323,7 @@ async function complete(names, done) {
       const job = await getJob(name);
       if (done(job)) { completeCount += 1; continue; }
       if (job.status === "email_otp") {
+        assert.notEqual(modes.filter(item => item.account === name).at(-1)?.mode, "reset", `修改密码不应等待邮箱验证码：${name}`);
         const response = await request(`/api/jobs/${job.id}/input`, { action: "email_otp", value: "123456" });
         assert.equal(response.status, 200, await response.text());
       } else if (job.status === "mfa_otp") {
