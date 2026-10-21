@@ -6,6 +6,7 @@ import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { getLogoutSession, logoutAllDevices, readLogoutResult, writeLogoutResult } from "./account-security.mjs";
 import { setAccountPassword, formatPasswordSetError } from "./password-set.mjs";
+import { rotateAccountTotp } from "./totp-rotate.mjs";
 import { validateAccountPassword } from "./password-policy.mjs";
 import { describeTlsHandshakeFailure } from "./connection-errors.mjs";
 import {
@@ -336,6 +337,10 @@ async function run() {
       return;
     }
     await transport.prepareProxy(proxyTemplate, `${chatgptBase}/`);
+    if (args.rotateTotp) {
+      await runTotpRotation(args, { chatgptBase, authBase, transport });
+      return;
+    }
     if (args.setPassword) {
       await runUniformPassword(args, { chatgptBase, authBase, transport });
       return;
@@ -678,6 +683,30 @@ async function run() {
   } finally {
     await transport.close();
   }
+}
+
+async function runTotpRotation(args, { chatgptBase, authBase, transport }) {
+  const email = String(args.email || "").trim();
+  if (!email || !args.totpResult || !process.env.CHATGPT_TOTP_ROTATE_ID) throw new Error("更换 2FA 缺少账号、操作编号或结果文件");
+  if (!process.env.CHATGPT_TOTP_SECRET) throw new Error("更换 2FA 需要原密钥，请先重新导入账号原有的 2FA 密钥");
+  const rl = readline.createInterface({ input, output });
+  try {
+    const client = new ProtocolClient({ verbose: args.verbose, transport });
+    console.log("[2fa-rotate] 正在重新登录并验证原 2FA，完成后更换新密钥。");
+    const web = await loginChatgptWeb(client, {
+      chatgptBase, authBase, email, rl,
+      password: process.env.CHATGPT_LOGIN_PASSWORD || "",
+      totpSecret: process.env.CHATGPT_TOTP_SECRET,
+    });
+    const session = await getLogoutSession(client, { chatgptBase, email });
+    await rotateAccountTotp(client, {
+      chatgptBase, email, session, deviceId: web.deviceId,
+      operationId: process.env.CHATGPT_TOTP_ROTATE_ID, resultPath: path.resolve(args.totpResult), generateTotp,
+    });
+  } catch (error) {
+    // 平台返回体可能含密钥或登录资料，只输出本流程生成的错误提示。
+    throw new Error(error.totpRotationMessage || "更换 2FA 的身份验证未完成，请检查原密码、原 2FA 或登录状态");
+  } finally { rl.close(); }
 }
 
 async function runUniformPassword(args, { chatgptBase, authBase, transport }) {
@@ -2377,6 +2406,7 @@ function parseArgs(argv) {
     else if (item === "--debug-auth") args.debugAuth = true;
     else if (item === "--web-only") args.webOnly = true;
     else if (item === "--setup-totp") args.setupTotp = true;
+    else if (item === "--rotate-totp") args.rotateTotp = true;
     else if (item === "--add-password") args.addPassword = true;
     else if (item === "--set-password") args.setPassword = true;
     else if (item === "--password-already-exists") args.passwordAlreadyExists = true;
@@ -2528,6 +2558,7 @@ Options:
   --logout-result <file>          保存登出状态，用于处理中断和不确定结果。
   --logout-operation-id <id>      登出操作唯一编号，防止同一次请求自动重放。
   --setup-totp                    Sign in and set up TOTP 2FA; skip Codex OAuth.
+  --rotate-totp                   验证原 2FA，关闭后重新启用并保存新密钥。
   --totp-result <file>            Private 2FA setup result. Default: ${DEFAULT_TOTP_RESULT}
   --add-password                  Sign in and add a password to a passwordless account.
   --set-password                  使用 CHATGPT_NEW_PASSWORD 为账号添加或修改密码。
@@ -2566,7 +2597,7 @@ Notes:
 }
 
 run().catch((error) => {
-  if (isProxyRiskControlError(error) && !process.argv.includes("--logout-all-devices") && !process.argv.includes("--set-password")) {
+  if (isProxyRiskControlError(error) && !process.argv.includes("--logout-all-devices") && !process.argv.includes("--set-password") && !process.argv.includes("--rotate-totp")) {
     console.error(`[proxy-risk-retry] ${String(error.message || "Proxy security check").slice(0, 320)}`);
   } else {
     console.error(`[error] ${describeTlsHandshakeFailure(error) || error.message}`);

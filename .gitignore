@@ -22,4 +22,8 @@ password-set-state.json
 password-set-state.json.*.tmp
 totp-setup-result.json
 totp-setup-result.json.*.tmp
+totp-rotate-state.json
+totp-rotate-state.json.*.tmp
+totp-rotate-result.json
+totp-rotate-result.json.*.tmp
 sub2api-monitor.json

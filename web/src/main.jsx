@@ -221,6 +221,9 @@ function App() {
   const totpSetupSelectedCount = selectedJobs.filter((job) => job.canSetupTotp).length;
   const canSetupTotpSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && totpSetupSelectedCount > 0;
+  const totpRotateSelectedCount = selectedJobs.filter((job) => job.canRotateTotp).length;
+  const canRotateTotpSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
+    && totpRotateSelectedCount > 0;
   const passwordAddSelectedCount = selectedJobs.filter((job) => job.canAddPassword).length;
   const canAddPasswordSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && passwordAddSelectedCount > 0;
@@ -585,6 +588,22 @@ function App() {
     }
   }
 
+  async function rotateTotpSelected() {
+    if (!canRotateTotpSelected || batchAction) return;
+    const skipped = selectedJobIds.size - totpRotateSelectedCount;
+    if (!window.confirm(`确定更换 ${totpRotateSelectedCount} 个账号的 2FA 吗？\n将验证原 2FA，先关闭再重新启用，每个账号生成独立新密钥并保存。旧验证器将失效；中途失败时可能需要继续设置 2FA。${skipped ? `\n另有 ${skipped} 个账号不符合条件，将跳过。` : ""}`)) return;
+    setBatchAction("rotate-2fa");
+    try {
+      const data = await apiFetch(token, "/api/jobs/rotate-2fa-batch", {
+        method: "POST", body: JSON.stringify({ ids: [...selectedJobIds], confirmed: true }),
+      });
+      setUploadNotice(`已开始为 ${data.started} 个账号更换 2FA，新密钥保存后可导出原始信息${data.skipped ? `，跳过 ${data.skipped} 个账号` : ""}${data.failures?.length ? `；${data.failures[0].error}` : ""}`);
+      setSelectedJobIds(new Set());
+      setError("");
+    } catch (requestError) { setError(requestError.message); }
+    finally { setBatchAction(""); }
+  }
+
   async function setupTotpSelected() {
     if (!canSetupTotpSelected || batchAction) return;
     const skipped = selectedJobIds.size - totpSetupSelectedCount;
@@ -941,6 +960,13 @@ function App() {
                 <button type="button" className="secondary-button bulk-button" onClick={setupTotpSelected} disabled={!canSetupTotpSelected || Boolean(batchAction)}>
                   {batchAction === "setup-2fa" ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}
                   批量设置 2FA
+                </button>
+              )}
+              {features.totpRotate && (
+                <button type="button" className="secondary-button bulk-button" onClick={rotateTotpSelected}
+                  disabled={!canRotateTotpSelected || Boolean(batchAction)} title="为已有 2FA 且已保存原密钥的账号更换验证器">
+                  {batchAction === "rotate-2fa" ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}
+                  批量更换 2FA
                 </button>
               )}
               {features.passwordAdd && (
@@ -1718,6 +1744,17 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
     }
   }
 
+  async function downloadTotpRecovery() {
+    setSubmitting(true);
+    try {
+      const response = await fetch(`/api/jobs/${job.id}/totp-rotation-recovery`, { headers: { "x-console-token": token } });
+      if (!response.ok) throw new Error((await response.json()).error || "下载 2FA 恢复信息失败");
+      await saveDownloadResponse(response, `${job.email}-2fa-recovery.json`);
+      onError("");
+    } catch (requestError) { onError(requestError.message); }
+    finally { setSubmitting(false); }
+  }
+
   async function download() {
     try {
       const response = await fetch(`/api/jobs/${job.id}/download`, {
@@ -1759,6 +1796,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           <div className="row-error">号池监控已永久跳过：{extractResponseMessage(job.autoRepairBlockedReason || "账号已不可用")}</div>
         )}
         {job.totpSetupError && <div className="row-error">2FA：{extractResponseMessage(job.totpSetupError)}</div>}
+        {job.totpRotationError && <div className="row-error">更换 2FA：{extractResponseMessage(job.totpRotationError)}</div>}
         {job.passwordAddError && <div className="row-error">添加密码：{extractResponseMessage(job.passwordAddError)}</div>}
         {job.passwordSetError && <div className="row-error">统一密码：{extractResponseMessage(job.passwordSetError)}</div>}
         {job.autoRepairPaused && <div className="security-paused"><ShieldCheck size={13} />自动重登已暂停</div>}
@@ -1873,6 +1911,11 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
           {totpSetupAvailable && job.canSetupTotp && (
             <button type="button" className="icon-button" onClick={setupTotp} disabled={submitting} title="设置 2FA">
               {submitting ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}
+            </button>
+          )}
+          {job.canDownloadTotpRecovery && (
+            <button type="button" className="secondary-button" onClick={downloadTotpRecovery} disabled={submitting}>
+              <Download size={16} />下载新 2FA 恢复信息
             </button>
           )}
           {logoutAllAvailable && (
@@ -2131,6 +2174,7 @@ function operationLabel(type) {
     automatic_relogin: "号池自动重登并授权",
     resume: "继续中断流程",
     setup_2fa: "设置 2FA",
+    rotate_2fa: "更换 2FA",
     add_password: "添加密码",
     set_password: "设置统一密码",
     logout_all: "登出所有设备",
