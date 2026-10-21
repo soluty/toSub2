@@ -7,6 +7,7 @@ import { spawn } from "node:child_process";
 const KEYCHAIN_SERVICE = "com.local.chatgpt-onboarding.credentials";
 const MAC_CREDENTIAL_ROOT = path.join(os.homedir(), "Library", "Application Support", "toSub2", "credentials");
 const WINDOWS_ENTROPY = "toSub2.credentials.v1";
+const linuxFileUpdates = new Map();
 
 const WINDOWS_PROTECT_SCRIPT = String.raw`
 $ErrorActionPreference = "Stop"
@@ -44,6 +45,8 @@ export function createCredentialStore(options = {}) {
   const platform = options.platform || process.platform;
   const windowsRoot = path.resolve(options.windowsRoot || defaultWindowsCredentialRoot());
   const macRoot = path.resolve(options.macRoot || process.env.TOSUB2_MAC_CREDENTIAL_ROOT || MAC_CREDENTIAL_ROOT);
+  const linuxRoot = path.resolve(options.linuxRoot || process.env.TOSUB2_LINUX_CREDENTIAL_ROOT
+    || path.join(os.homedir(), ".local", "share", "toSub2", "credentials"));
   const securityRunner = options.securityRunner || runSecurity;
   const powerShellRunner = options.powerShellRunner || runPowerShell;
 
@@ -57,6 +60,10 @@ export function createCredentialStore(options = {}) {
       });
       if (platform === "darwin") {
         await saveMacCredential(macRoot, email, payload, securityRunner);
+        return;
+      }
+      if (platform === "linux") {
+        await saveLinuxCredential(linuxRoot, email, payload);
         return;
       }
       if (platform === "win32") {
@@ -74,13 +81,14 @@ export function createCredentialStore(options = {}) {
         await fs.writeFile(filePath, `${result.stdout.trim()}\n`, { mode: 0o600 });
         return;
       }
-      throw credentialError(501, "持久保存登录凭据和代理配置目前支持 macOS Keychain（钥匙串）和 Windows DPAPI（数据保护接口）");
+      throw credentialError(501, "当前平台不支持持久凭据存储；支持 Linux、macOS Keychain 和 Windows DPAPI");
     },
 
     async load(email) {
       if (platform === "darwin") {
         return loadMacCredential(macRoot, email, securityRunner);
       }
+      if (platform === "linux") return loadLinuxCredential(linuxRoot, email);
       if (platform === "win32") {
         let cipherText;
         try {
@@ -100,6 +108,15 @@ export function createCredentialStore(options = {}) {
     },
 
     async delete(email) {
+      if (platform === "linux") {
+        await updateLinuxCredentialFile(linuxRoot, data => {
+          const key = credentialAccount(email);
+          if (!Object.hasOwn(data.accounts, key)) return false;
+          delete data.accounts[key];
+          return true;
+        });
+        return;
+      }
       if (platform === "darwin") {
         const result = await securityRunner([
           "delete-generic-password",
@@ -140,6 +157,76 @@ function windowsCredentialPath(root, email) {
 function macCredentialPath(root, email) {
   const id = crypto.createHash("sha256").update(credentialAccount(email)).digest("hex");
   return path.join(root, `${id}.enc`);
+}
+
+async function readLinuxCredentialFile(root) {
+  const file = path.join(root, "credentials.json");
+  let raw;
+  try { raw = await fs.readFile(file, "utf8"); }
+  catch (error) {
+    if (error.code === "ENOENT") return { version: 1, accounts: {} };
+    throw credentialError(500, "无法读取 Linux 凭据文件，请检查文件权限");
+  }
+  try {
+    const data = JSON.parse(raw);
+    if (data?.version !== 1 || !data.accounts || typeof data.accounts !== "object" || Array.isArray(data.accounts)) {
+      throw new Error("invalid credentials file");
+    }
+    for (const value of Object.values(data.accounts)) {
+      if (!value || typeof value !== "object" || ["password", "totpSecret", "proxyUrl"].some(key => typeof value[key] !== "string")) {
+        throw new Error("invalid credentials entry");
+      }
+    }
+    return data;
+  } catch {
+    throw credentialError(500, "Linux 凭据文件格式损坏，已保留原文件，请恢复备份后重试");
+  }
+}
+
+function updateLinuxCredentialFile(root, update) {
+  const previous = linuxFileUpdates.get(root) || Promise.resolve();
+  const current = previous.catch(() => {}).then(async () => {
+    const data = await readLinuxCredentialFile(root);
+    if (!update(data)) return;
+    await fs.mkdir(root, { recursive: true, mode: 0o700 });
+    await fs.chmod(root, 0o700);
+    const file = path.join(root, "credentials.json");
+    const temporary = path.join(root, `.credentials.${crypto.randomUUID()}.tmp`);
+    try {
+      const handle = await fs.open(temporary, "wx", 0o600);
+      try {
+        await handle.writeFile(`${JSON.stringify(data, null, 2)}\n`);
+        await handle.sync();
+      } finally { await handle.close(); }
+      await fs.rename(temporary, file);
+      if (process.platform === "linux") {
+        const directory = await fs.open(root, "r");
+        try { await directory.sync(); }
+        finally { await directory.close(); }
+      }
+    } finally { await fs.rm(temporary, { force: true }); }
+  });
+  linuxFileUpdates.set(root, current);
+  const cleanup = () => { if (linuxFileUpdates.get(root) === current) linuxFileUpdates.delete(root); };
+  void current.then(cleanup, cleanup);
+  return current;
+}
+
+async function saveLinuxCredential(root, email, payload) {
+  const { password, totpSecret, proxyUrl } = JSON.parse(payload);
+  await updateLinuxCredentialFile(root, data => {
+    Object.defineProperty(data.accounts, credentialAccount(email), {
+      value: { password, totpSecret, proxyUrl }, enumerable: true, writable: true, configurable: true,
+    });
+    return true;
+  });
+}
+
+async function loadLinuxCredential(root, email) {
+  await linuxFileUpdates.get(root)?.catch(() => {});
+  const data = await readLinuxCredentialFile(root);
+  const key = credentialAccount(email);
+  return Object.hasOwn(data.accounts, key) ? { ...data.accounts[key] } : emptyCredentials();
 }
 
 async function saveMacCredential(root, email, payload, securityRunner) {

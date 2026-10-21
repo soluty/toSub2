@@ -614,6 +614,14 @@ tbody tr:last-child td { border-bottom: 0; }
 .batch-dialog textarea:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(18, 113, 91, .1); }
 .batch-dialog textarea::placeholder { color: #98a19e; }
 .filter-dialog textarea { min-height: 220px; }
+.password-batch-dialog { width: min(480px, calc(100vw - 32px)); color: var(--ink); }
+.password-batch-dialog:not([open]) { display: none; }
+.password-batch-dialog::backdrop { background: rgba(22, 31, 28, .42); }
+.password-batch-dialog form > p { margin: 20px 0 16px; font-size: 13px; line-height: 1.7; }
+.password-batch-dialog .batch-label { display: block; }
+.password-batch-dialog input[type="password"] { width: 100%; min-height: 40px; border: 1px solid #cdd5d1; border-radius: 5px; padding: 9px 12px; font: inherit; }
+.password-batch-dialog input:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
+.password-batch-dialog form > .password-batch-hint { margin: 8px 0 0; color: var(--muted); font-size: 12px; }
 .security-paused { display: flex; align-items: center; gap: 5px; margin-top: 7px; color: #8b692e; font-size: 11px; }
 .logout-all-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 36px; padding: 0 13px; border: 1px solid #ad443d; border-radius: 5px; background: #ad443d; color: #fff; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; }
 .logout-all-button:hover:not(:disabled) { background: #943b35; }

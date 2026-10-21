@@ -99,7 +99,63 @@ try {
     proxyUrl: "",
   });
 
-  const unsupportedStore = createCredentialStore({ platform: "linux" });
+  const linuxRoot = path.join(tempRoot, "linux");
+  const linuxStore = createCredentialStore({ platform: "linux", linuxRoot });
+  const linuxFile = path.join(linuxRoot, "credentials.json");
+  const empty = { password: "", totpSecret: "", proxyUrl: "" };
+  assert.deepEqual(await linuxStore.load(email), empty);
+  await linuxStore.delete(email);
+  await assert.rejects(fs.access(linuxFile), { code: "ENOENT" });
+  await linuxStore.save(` ${email} `, credentials);
+  const reopened = createCredentialStore({ platform: "linux", linuxRoot });
+  assert.deepEqual(await reopened.load(email.toUpperCase()), credentials);
+  await reopened.save(email, updatedCredentials);
+  assert.deepEqual(await linuxStore.load(email), updatedCredentials);
+  if (process.platform !== "win32") {
+    assert.equal((await fs.stat(linuxRoot)).mode & 0o777, 0o700);
+    assert.equal((await fs.stat(linuxFile)).mode & 0o777, 0o600);
+    // 已存在的宽权限文件也会在更新时被替换为私有文件。
+    await fs.chmod(linuxRoot, 0o755);
+    await fs.chmod(linuxFile, 0o644);
+    await linuxStore.save(email, updatedCredentials);
+    assert.equal((await fs.stat(linuxRoot)).mode & 0o777, 0o700);
+    assert.equal((await fs.stat(linuxFile)).mode & 0o777, 0o600);
+  }
+
+  // 多个 store 实例批量写入及删除时，不能丢失其他账号。
+  const batchEmails = Array.from({ length: 24 }, (_, index) => `batch-${index}@example.com`);
+  await Promise.all(batchEmails.map((account, index) =>
+    (index % 2 ? linuxStore : reopened).save(account, { ...credentials, password: `password-${index}` })));
+  await Promise.all([
+    ...batchEmails.slice(0, 12).map(account => linuxStore.delete(account)),
+    ...batchEmails.slice(12).map(account => reopened.save(account, updatedCredentials)),
+  ]);
+  for (const [index, account] of batchEmails.entries()) {
+    assert.deepEqual(await reopened.load(account), index < 12 ? empty : updatedCredentials);
+  }
+  assert.deepEqual(await fs.readdir(linuxRoot), ["credentials.json"]);
+  await linuxStore.delete(email.toUpperCase());
+  assert.deepEqual(await reopened.load(email), empty);
+
+  // 格式损坏时不把现有文件当成空存储覆盖，修复后队列仍能正常工作。
+  const validFile = await fs.readFile(linuxFile, "utf8");
+  for (const corrupt of ["{broken", '{"version":1,"accounts":[]}', '{"version":1,"accounts":{"x":{"password":42}}}']) {
+    await fs.writeFile(linuxFile, corrupt);
+    await assert.rejects(linuxStore.load(email), /格式损坏/);
+    await assert.rejects(linuxStore.save(email, credentials), /格式损坏/);
+    await assert.rejects(linuxStore.delete(email), /格式损坏/);
+    assert.equal(await fs.readFile(linuxFile, "utf8"), corrupt);
+  }
+  await fs.writeFile(linuxFile, validFile);
+  await linuxStore.save(email, credentials);
+  assert.deepEqual(await reopened.load(email), credentials);
+  const blockedRoot = path.join(tempRoot, "not-a-directory");
+  await fs.writeFile(blockedRoot, "保留此文件");
+  const blockedStore = createCredentialStore({ platform: "linux", linuxRoot: blockedRoot });
+  await assert.rejects(blockedStore.save(email, credentials), /无法读取 Linux 凭据文件/);
+  assert.equal(await fs.readFile(blockedRoot, "utf8"), "保留此文件");
+
+  const unsupportedStore = createCredentialStore({ platform: "freebsd" });
   await assert.rejects(
     unsupportedStore.save(email, credentials),
     (error) => error.status === 501 && error.message.includes("Windows DPAPI"),

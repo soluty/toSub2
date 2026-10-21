@@ -5,6 +5,9 @@ import path from "node:path";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { getLogoutSession, logoutAllDevices, readLogoutResult, writeLogoutResult } from "./account-security.mjs";
+import { setAccountPassword, formatPasswordSetError } from "./password-set.mjs";
+import { validateAccountPassword } from "./password-policy.mjs";
+import { describeTlsHandshakeFailure } from "./connection-errors.mjs";
 import {
   browserIdentityForTlsProfile,
   shouldUseTlsTransport,
@@ -226,8 +229,14 @@ class ProtocolClient {
       this.jar.merge(res.headers.transportCookies);
       text = await res.text();
     } catch (error) {
+      error.requestInfo = {
+        method, origin: targetUrl.origin, pathname: targetUrl.pathname,
+        connectionMode: this.transport?.hasConfiguredProxy() ? "proxy" : "direct",
+      };
       if (error?.name === "AbortError") {
-        throw new Error(`${method} ${safeUrl(url)} timed out after ${options.timeoutMs || DEFAULT_TIMEOUT_MS}ms`);
+        throw Object.assign(new Error(`${method} ${safeUrl(url)} timed out after ${options.timeoutMs || DEFAULT_TIMEOUT_MS}ms`, { cause: error }), {
+          requestInfo: error.requestInfo, code: "ETIMEDOUT",
+        });
       }
       throw error;
     } finally {
@@ -241,12 +250,12 @@ class ProtocolClient {
     }
 
     if (isRiskControlResponse(res, text)) {
-      throw new Error(
+      throw Object.assign(new Error(
         `PROXY_RISK_CONTROL: ${method} ${safeUrl(url)} returned HTTP ${res.status} with a security-check page`,
-      );
+      ), { requestInfo: { method, origin: targetUrl.origin, pathname: targetUrl.pathname }, httpStatus: res.status });
     }
 
-    return { res, text, location: location ? new URL(location, url).toString() : null, url };
+    return { res, text, location: location ? new URL(location, url).toString() : null, url, method };
   }
 
   async follow(url, options = {}) {
@@ -274,7 +283,11 @@ class ProtocolClient {
     try {
       return { data: JSON.parse(result.text), result };
     } catch {
-      throw new Error(`Expected JSON from ${url}, got: ${result.text.slice(0, 160)}`);
+      const parsed = new URL(url);
+      throw Object.assign(new Error(`Expected JSON from ${url}, got: ${result.text.slice(0, 160)}`), {
+        code: "INVALID_JSON_RESPONSE", httpStatus: result.res.status,
+        requestInfo: { method, origin: parsed.origin, pathname: parsed.pathname },
+      });
     }
   }
 }
@@ -323,6 +336,10 @@ async function run() {
       return;
     }
     await transport.prepareProxy(proxyTemplate, `${chatgptBase}/`);
+    if (args.setPassword) {
+      await runUniformPassword(args, { chatgptBase, authBase, transport });
+      return;
+    }
     if (args.logoutAllDevices) {
       await runLogoutAllDevices(args, { chatgptBase, authBase, transport });
       return;
@@ -660,6 +677,69 @@ async function run() {
     }
   } finally {
     await transport.close();
+  }
+}
+
+async function runUniformPassword(args, { chatgptBase, authBase, transport }) {
+  const email = String(args.email || "").trim();
+  const password = validateAccountPassword(process.env.CHATGPT_NEW_PASSWORD);
+  if (!email || !args.passwordSetResult || !process.env.CHATGPT_PASSWORD_SET_ID) throw new Error("统一密码设置缺少账号、结果文件或操作编号");
+  const rl = readline.createInterface({ input, output });
+  let phase = "读取已保存的登录状态";
+  try {
+    let client = null;
+    let web = null;
+    if (args.resumeCheckpoint) {
+      let checkpoint;
+      try { checkpoint = await readProtocolCheckpoint(path.resolve(args.resumeCheckpoint)); }
+      catch (error) { if (error.code !== "ENOENT") throw new Error("登录检查点不可用，请重新登录"); }
+      if (checkpoint) {
+        if (checkpoint.email.toLowerCase() !== email.toLowerCase()) throw new Error("登录检查点与所选账号不一致");
+        client = new ProtocolClient({ verbose: args.verbose, jar: CookieJar.fromJSON(checkpoint.cookies), transport });
+        try { await getLogoutSession(client, { chatgptBase, email }); }
+        catch (error) { if (error.code !== "LOGOUT_LOGIN_REQUIRED") throw error; client = null; }
+        web = checkpoint.web;
+      }
+    }
+    if (!client) {
+      client = new ProtocolClient({ verbose: args.verbose, transport });
+      phase = "建立密码设置会话";
+      await client.follow(`${chatgptBase}/`, { referer: `${chatgptBase}/` });
+    }
+    console.log("[password-set] 进入邮箱验证改密流程，已保留本次输入的统一新密码。");
+    const deviceId = web?.deviceId || client.jar.value("oai-did", `${chatgptBase}/`) || crypto.randomUUID();
+    phase = "验证账号并设置新密码";
+    await setAccountPassword(client, {
+      chatgptBase, authBase, email, deviceId, password,
+      hasPassword: args.passwordAlreadyExists,
+      resultPath: path.resolve(args.passwordSetResult), operationId: process.env.CHATGPT_PASSWORD_SET_ID,
+      verifyEmail: (accountClient, referer) => verifyAddPasswordEmailOtp(accountClient, { authBase, rl, deviceId, referer }),
+      verifyCurrentPassword: async (accountClient, referer) => {
+        const currentPassword = process.env.CHATGPT_LOGIN_PASSWORD || "";
+        if (!currentPassword) return null;
+        console.log("[password-set] 平台要求验证原密码，正在使用已保存的原密码。");
+        try {
+          return await verifyPassword(accountClient, { authBase, rl, deviceId, password: currentPassword, referer, interactive: false });
+        } catch (error) {
+          if (!isRejectedPasswordError(error)) throw error;
+          console.log("[password-set] 已保存的原密码被拒绝，尝试平台提供的邮箱验证码方式。");
+          return null;
+        }
+      },
+      ensureAccount: accountClient => getLogoutSession(accountClient, { chatgptBase, email }),
+      completeMfa: (accountClient, payload, referer) => completeTotpMfaIfNeeded(accountClient, {
+        authBase, rl, deviceId, payload, referer, totpSecret: process.env.CHATGPT_TOTP_SECRET || "",
+      }),
+      sentinelHeaders: accountClient => createSentinelHeaders(accountClient, { authBase, deviceId, flow: "password_reset" }),
+    });
+    if (args.resumeCheckpoint) await removeProtocolCheckpoint(path.resolve(args.resumeCheckpoint));
+  } catch (error) {
+    // 新旧密码都不进入错误日志；新密码只在平台确认成功后写入私有结果文件。
+    throw new Error(error.code === "PASSWORD_SET_RESULT_UNKNOWN"
+      ? "PASSWORD_SET_RESULT_UNKNOWN: 密码设置结果待核实，请先确认新密码是否生效"
+      : formatPasswordSetError(error, phase));
+  } finally {
+    rl.close();
   }
 }
 
@@ -1177,7 +1257,7 @@ async function selectChatgptLoginWorkspaceIfNeeded(client, { authBase, payload }
   return data;
 }
 
-async function verifyPassword(client, { authBase, rl, deviceId, password, referer }) {
+async function verifyPassword(client, { authBase, rl, deviceId, password, referer, interactive = true }) {
   let nextPassword = password;
   for (;;) {
     const value = nextPassword || (await ask(rl, "Password (q=quit): "));
@@ -1196,6 +1276,7 @@ async function verifyPassword(client, { authBase, rl, deviceId, password, refere
       return data;
     } catch (error) {
       if (!isRejectedPasswordError(error)) throw error;
+      if (!interactive) throw error;
       console.log("[warn] Password was rejected. Enter it again, or q to quit.");
     }
   }
@@ -2110,7 +2191,11 @@ function assertOk(result, label) {
   const { res, text } = result;
   if (res.status >= 200 && res.status < 300) return;
   const body = text.replace(/\s+/g, " ").slice(0, 220);
-  throw new Error(`${label} failed with HTTP ${res.status}: ${body}`);
+  const url = new URL(result.url);
+  throw Object.assign(new Error(`${label} failed with HTTP ${res.status}: ${body}`), {
+    httpStatus: res.status,
+    requestInfo: { method: result.method, origin: url.origin, pathname: url.pathname },
+  });
 }
 
 function isRiskControlResponse(res, text) {
@@ -2290,6 +2375,9 @@ function parseArgs(argv) {
     else if (item === "--web-only") args.webOnly = true;
     else if (item === "--setup-totp") args.setupTotp = true;
     else if (item === "--add-password") args.addPassword = true;
+    else if (item === "--set-password") args.setPassword = true;
+    else if (item === "--password-already-exists") args.passwordAlreadyExists = true;
+    else if (item === "--password-set-result") args.passwordSetResult = argv[++i];
     else if (item === "--logout-all-devices") args.logoutAllDevices = true;
     else if (item === "--logout-result") args.logoutResult = argv[++i];
     else if (item === "--logout-operation-id") args.logoutOperationId = argv[++i];
@@ -2439,6 +2527,9 @@ Options:
   --setup-totp                    Sign in and set up TOTP 2FA; skip Codex OAuth.
   --totp-result <file>            Private 2FA setup result. Default: ${DEFAULT_TOTP_RESULT}
   --add-password                  Sign in and add a password to a passwordless account.
+  --set-password                  使用 CHATGPT_NEW_PASSWORD 为账号添加或修改密码。
+  --password-already-exists       已有密码时使用密码重置流程。
+  --password-set-result <file>    保存平台已确认的新密码，供控制台更新账号资料。
   --password-add-result <file>    Private add-password result. Default: ${DEFAULT_PASSWORD_ADD_RESULT}
   --out <file>                    Output JSON path. Default: ${DEFAULT_OUT}
   --sub2api-out <file>            sub2api import JSON path. Default: ${DEFAULT_SUB2API_OUT}
@@ -2472,10 +2563,10 @@ Notes:
 }
 
 run().catch((error) => {
-  if (isProxyRiskControlError(error) && !process.argv.includes("--logout-all-devices")) {
+  if (isProxyRiskControlError(error) && !process.argv.includes("--logout-all-devices") && !process.argv.includes("--set-password")) {
     console.error(`[proxy-risk-retry] ${String(error.message || "Proxy security check").slice(0, 320)}`);
   } else {
-    console.error(`[error] ${error.message}`);
+    console.error(`[error] ${describeTlsHandshakeFailure(error) || error.message}`);
   }
   process.exitCode = 1;
 });

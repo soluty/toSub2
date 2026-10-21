@@ -8,7 +8,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import react from "@vitejs/plugin-react";
-import { createServer as createViteServer } from "vite";
+import { createServer as createViteServer, normalizePath } from "vite";
 import { createCredentialStore } from "./credential-store.mjs";
 import {
   fetchMailboxOtpCandidates,
@@ -18,6 +18,8 @@ import {
 import { createSmsProvider, publicSmsProviderDefinitions } from "./sms-providers.mjs";
 import { DirectTlsProfileProbe, proxySupportsSessionRotation } from "./tls-transport.mjs";
 import { LOGOUT_RESULT_FILENAME, readLogoutResult, writeLogoutResult } from "./account-security.mjs";
+import { validateAccountPassword } from "./password-policy.mjs";
+import { PASSWORD_SET_STATE_FILENAME, readPasswordState, writePasswordJson } from "./password-set.mjs";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 4399;
@@ -64,7 +66,8 @@ const OUTPUT_ROOT = path.resolve(
   process.env.ONBOARDING_OUTPUT_ROOT || path.join(WORKSPACE_ROOT, "tmp", "chatgpt-onboarding-console"),
 );
 const SUB2API_MONITOR_PATH = path.join(OUTPUT_ROOT, SUB2API_MONITOR_FILENAME);
-const credentialStore = createCredentialStore();
+const LINUX_CREDENTIAL_ROOT = path.resolve(process.env.TOSUB2_LINUX_CREDENTIAL_ROOT || path.join(OUTPUT_ROOT, ".credentials"));
+const credentialStore = createCredentialStore({ linuxRoot: LINUX_CREDENTIAL_ROOT });
 const consoleToken = crypto.randomBytes(24).toString("base64url");
 const jobs = new Map();
 const customSmsPoolPositions = new Map();
@@ -120,6 +123,7 @@ await fs.mkdir(OUTPUT_ROOT, { recursive: true });
 await loadSub2ApiMonitorConfiguration();
 await syncCompletedOutputs(true);
 await restoreLogoutOperations();
+await restorePasswordSetOperations();
 scheduleQueuedJobs();
 scheduleSub2ApiMonitor();
 
@@ -132,6 +136,14 @@ const vite = await createViteServer({
   server: {
     middlewareMode: true,
     hmr: { port: hmrPort, clientPort: hmrPort },
+    fs: {
+      deny: [
+        ".env", ".env.*", "*.{crt,pem}", "**/.git/**",
+        `${normalizePath(OUTPUT_ROOT)}/**`, `${normalizePath(LINUX_CREDENTIAL_ROOT)}/**`,
+        "**/.credentials/**", "**/credentials.json", "**/.credentials.*.tmp",
+        "**/{password-add-result,password-set-state,totp-setup-result,job-meta,login-checkpoint,sub2api-monitor}.json{,.*.tmp}",
+      ],
+    },
   },
 });
 
@@ -218,6 +230,7 @@ async function handleApi(req, res, requestUrl) {
         tlsFingerprint: true,
         totpSetup: true,
         passwordAdd: true,
+        passwordSet: true,
         forceRelogin: true,
         logoutAllDevices: true,
       },
@@ -369,6 +382,31 @@ async function handleApi(req, res, requestUrl) {
       started: eligible.length,
       skipped: selected.length - eligible.length,
     });
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/jobs/set-password-batch") {
+    const body = await readJson(req);
+    let password;
+    try { password = validateAccountPassword(body.password); }
+    catch (error) { throw httpError(400, error.message); }
+    if (Object.hasOwn(body, "proxyUrl")) normalizeProxyUrl(body.proxyUrl);
+    const selected = resolveSelectedJobs(body.ids);
+    const results = await Promise.all(selected.map(job => withEmailJobLock(job.email, async () => {
+      if (!canSetPassword(job)) return { job, started: false };
+      try {
+        await startPasswordSet(job, password, body);
+        return { job, started: true };
+      } catch (error) {
+        return { job, started: false, error: error.status === 500 ? error.message : "无法启动密码设置，请检查本机凭据和数据目录" };
+      }
+    })));
+    const started = results.filter(result => result.started);
+    const failures = results.filter(result => result.error).map(result => ({ id: result.job.id, error: result.error }));
+    if (!started.length) throw httpError(failures.length ? 500 : 409,
+      failures[0]?.error || "选中的账号当前都不能设置统一密码，请等待其他操作结束后重试");
+    sendJson(res, 200, { jobs: started.map(result => publicJob(result.job)), started: started.length,
+      skipped: selected.length - started.length - failures.length, failures });
     return;
   }
 
@@ -779,6 +817,8 @@ function scheduleQueuedJobs() {
       ? "refreshing"
       : mode === "logout_all"
         ? "logout_starting"
+      : mode === "password_set"
+        ? "password_set_starting"
       : mode === "totp_setup"
         ? "totp_starting"
         : mode === "password_add"
@@ -802,11 +842,16 @@ function scheduleQueuedJobs() {
 
 async function prepareAndLaunchJob(job, mode, queueRunId) {
   try {
-    if (["full", "totp_setup", "password_add", "logout_all"].includes(mode) && job.mailApiUrl) await loadMailboxBaseline(job);
+    if (["full", "totp_setup", "password_add", "password_set", "logout_all"].includes(mode) && job.mailApiUrl) await loadMailboxBaseline(job);
     if (!isActive(job.status) || job.status === "queued" || job.queueRunId !== queueRunId) return;
     launchJob(job, { mode });
   } catch (error) {
     if (job.queueRunId !== queueRunId || job.deleted) return;
+    if (mode === "password_set") {
+      await finishPasswordSet(job, "密码设置准备失败，请检查账号资料后重试");
+      scheduleQueuedJobs();
+      return;
+    }
     if (mode === "logout_all") {
       await finishLogoutAll(job, "登出请求准备未完成，请检查登录资料后重试");
       scheduleQueuedJobs();
@@ -848,6 +893,10 @@ function launchJob(job, options = {}) {
     ? [PROTOCOL_SCRIPT, "--email", job.email, "--logout-all-devices",
         "--resume-checkpoint", job.checkpointPath,
         "--logout-result", logoutResultPath(job), "--logout-operation-id", job.logout.operationId, "--verbose"]
+    : mode === "password_set"
+      ? [PROTOCOL_SCRIPT, "--email", job.email, "--set-password", "--password-set-result", job.passwordAddResultPath,
+          "--resume-checkpoint", job.checkpointPath,
+          ...(job.password || job.hasPasswordCredential ? ["--password-already-exists"] : []), "--verbose"]
     : mode === "refresh"
     ? [
         PROTOCOL_SCRIPT,
@@ -899,7 +948,8 @@ function launchJob(job, options = {}) {
       ...process.env,
       CHATGPT_LOGIN_PASSWORD: job.password || "",
       CHATGPT_TOTP_SECRET: job.totpSecret || "",
-      CHATGPT_NEW_PASSWORD: mode === "password_add" ? job.pendingNewPassword || "" : "",
+      CHATGPT_NEW_PASSWORD: mode === "password_set" ? job.pendingUniformPassword || "" : mode === "password_add" ? job.pendingNewPassword || "" : "",
+      CHATGPT_PASSWORD_SET_ID: mode === "password_set" ? job.passwordSet.operationId : "",
       CHATGPT_PROXY_URL: job.proxyUrl || "",
       CHATGPT_PROXY_MAX_ATTEMPTS: String(Math.max(0, MAX_PROXY_RISK_RETRIES - (job.proxyRiskRetryCount || 0))),
       TOSUB2_TLS_PROFILE:
@@ -919,7 +969,8 @@ function launchJob(job, options = {}) {
   child.on("error", (error) => {
     void withEmailJobLock(job.email, async () => {
       if (job.runId !== runId) return;
-      if (mode === "logout_all") await finishLogoutAll(job, "无法启动登出进程");
+      if (mode === "password_set") await finishPasswordSet(job, "无法启动统一密码设置进程");
+      else if (mode === "logout_all") await finishLogoutAll(job, "无法启动登出进程");
       else if (mode === "totp_setup") restoreTotpSetupFailure(job, `无法启动 2FA 设置进程：${error.message}`);
       else if (mode === "password_add") restorePasswordAddFailure(job, `无法启动添加密码进程：${error.message}`);
       else failJob(job, `无法启动登录进程：${error.message}`);
@@ -937,6 +988,11 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
   if (job.runId !== runId) return;
   stopMailPolling(job);
   job.child = null;
+  if (mode === "password_set") {
+    await finishPasswordSet(job);
+    scheduleQueuedJobs();
+    return;
+  }
   if (mode === "logout_all") {
     await finishLogoutAll(job);
     scheduleQueuedJobs();
@@ -981,9 +1037,16 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
 }
 
 function handleChildCloseFailure(job, mode, runId, error) {
-  if (job.runId !== runId && !(["totp_setup", "password_add", "logout_all"].includes(mode) && job.runId === null)) return;
+  if (job.runId !== runId && !(["totp_setup", "password_add", "password_set", "logout_all"].includes(mode) && job.runId === null)) return;
   const message = `收尾处理失败：${error.message}`;
-  if (mode === "logout_all") {
+  if (mode === "password_set") {
+    job.status = "reauth_required";
+    job.prompt = "统一密码设置的收尾未完成";
+    job.passwordSetError = "请重启服务恢复已保存的结果，新密码不会自动重复提交";
+    job.runId = null;
+    job.runMode = null;
+    job.pendingUniformPassword = null;
+  } else if (mode === "logout_all") {
     job.status = "reauth_required";
     job.prompt = "登出结果已保留，本地清理需要重试";
     job.lastError = "请重启服务以恢复登出结果并完成清理；自动重登保持暂停";
@@ -1006,6 +1069,7 @@ function handleChildCloseFailure(job, mode, runId, error) {
 }
 
 async function retryJob(job, options = {}) {
+  if (isPasswordSetRunning(job)) throw httpError(409, "统一密码设置正在进行中");
   if (isLogoutRunning(job)) throw httpError(409, "登出操作尚未结束，暂不能重新授权");
   if (!["failed", "canceled", "reauth_required", "resume_available"].includes(job.status)) {
     throw httpError(409, "当前任务不需要重新授权");
@@ -1172,7 +1236,7 @@ function isLogoutRunning(job) {
 }
 
 function canLogoutAll(job) {
-  return !shuttingDown && !isLogoutRunning(job)
+  return !shuttingDown && !isLogoutRunning(job) && !isPasswordSetRunning(job)
     && !["totp_setup", "password_add"].includes(job.runMode)
     && !(job.status === "queued" && ["totp_setup", "password_add"].includes(job.queuedMode));
 }
@@ -1308,6 +1372,131 @@ async function startTotpSetup(job, options = {}) {
   recordJobOperation(job, "setup_2fa");
   appendJobLog(job, `\n[2fa] 开始第 ${job.totpSetupAttempt} 次 2FA 设置，原授权文件保持不变。\n`);
   enqueueJob(job, "totp_setup", "正在重新验证账号并准备设置 2FA");
+}
+
+function isPasswordSetRunning(job) {
+  return job.runMode === "password_set" || (job.status === "queued" && job.queuedMode === "password_set");
+}
+
+function canSetPassword(job) {
+  if (shuttingDown || isLogoutRunning(job) || isPasswordSetRunning(job)
+    || ["password_add", "totp_setup"].includes(job.runMode)) return false;
+  return isTerminalStatus(job.status) || (job.loginCheckpointAvailable && ["phone", "phone_otp"].includes(job.status));
+}
+
+function passwordSetStatePath(job) {
+  return path.join(path.dirname(job.outputPath), PASSWORD_SET_STATE_FILENAME);
+}
+
+async function startPasswordSet(job, password, options = {}) {
+  if (!canSetPassword(job)) throw httpError(409, "当前账号正在执行其他操作");
+  await reloadMissingJobCredentials(job);
+  if (Object.hasOwn(options, "proxyUrl")) {
+    job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
+    await saveStoredLoginCredentials(job.email, job);
+  }
+  stopMailPolling(job);
+  releaseSmsNumber(job, "idle");
+  job.queueRunId = null;
+  job.runId = crypto.randomUUID();
+  const child = job.child;
+  const exited = waitForChildExit(child, 3_000);
+  child?.kill("SIGTERM");
+  job.child = null;
+  await exited;
+  job.passwordSet = { version: 1, operationId: crypto.randomUUID(), email: job.email, state: "preparing", startedAt: new Date().toISOString() };
+  job.pendingUniformPassword = password;
+  job.passwordSetError = null;
+  job.lastError = null;
+  job.parserTail = "";
+  job.currentPhone = null;
+  job.phoneError = null;
+  job.securityCheckRequired = false;
+  job.runMode = "password_set";
+  job.status = "password_set_starting";
+  recordJobOperation(job, "set_password");
+  try {
+    await writePasswordJson(passwordSetStatePath(job), job.passwordSet);
+    await saveJobMetadata(job);
+  } catch (error) {
+    job.pendingUniformPassword = null;
+    job.runMode = null;
+    job.queuedMode = null;
+    job.status = "failed";
+    job.passwordSet.state = "failed";
+    job.passwordSetError = "无法保存密码操作状态，请检查数据目录后重试";
+    job.prompt = "统一密码设置尚未启动";
+    throw error;
+  }
+  appendJobLog(job, "[password-set] 开始验证账号并设置统一密码，新密码不会写入日志。\n");
+  enqueueJob(job, "password_set", "正在验证账号并准备设置统一密码");
+}
+
+async function finishPasswordSet(job, failureMessage = null, restoring = false) {
+  const stored = await readPasswordState(passwordSetStatePath(job), job.passwordSet.operationId, job.email);
+  let result;
+  try { result = JSON.parse(await fs.readFile(job.passwordAddResultPath, "utf8")); } catch {}
+  const confirmed = result?.version === 1 && result.confirmed === true
+    && result.operationId === job.passwordSet.operationId && result.email?.toLowerCase() === job.email.toLowerCase()
+    && typeof result.password === "string" && (restoring || result.password === job.pendingUniformPassword);
+  const completed = confirmed || (restoring && stored?.state === "completed");
+  const previousError = job.passwordSetError;
+  let credentialsPersisted = false;
+  job.passwordSet = { ...(stored || job.passwordSet), state: completed ? "completed"
+    : ["submitted", "unknown", "completed"].includes(stored?.state) || !stored ? "unknown" : "failed" };
+  job.passwordSetError = null;
+  if (completed) {
+    if (confirmed) {
+      job.password = result.password;
+      job.passwordAddedAt = result.added_at;
+    }
+    job.hasPasswordCredential = true;
+    job.loginMode = "password";
+    job.passwordAddError = null;
+    try {
+      if (job.password && await saveStoredLoginCredentials(job.email, job)) credentialsPersisted = true;
+      else job.passwordSetError = job.password
+        ? "新密码已保存在本机私有结果文件中，当前系统不支持系统凭据存储"
+        : "平台已确认设置成功，但本机无法恢复密码，请重新输入账号资料";
+    } catch {
+      job.passwordSetError = "平台已确认设置成功，系统凭据保存失败；已保留私有结果文件，请重启后恢复";
+    }
+    job.prompt = "统一密码设置成功，账号原始信息已更新";
+  } else {
+    job.passwordSetError = stored?.error || previousError || failureMessage || (job.passwordSet.state === "unknown"
+      ? "新密码提交后流程中断，结果待核实；不会自动重新提交" : "身份验证未完成，统一密码尚未设置");
+    job.prompt = job.passwordSet.state === "unknown" ? "密码设置结果待核实" : "统一密码设置未完成";
+  }
+  if (["completed", "unknown"].includes(job.passwordSet.state)) {
+    await removePrivateFile(job.checkpointPath);
+    job.loginCheckpointAvailable = false;
+  }
+  job.passwordSet.error = job.passwordSetError;
+  job.passwordSet.updatedAt = new Date().toISOString();
+  job.status = job.resultSaved ? "completed" : job.loginCheckpointAvailable ? "resume_available" : "reauth_required";
+  job.lastError = null;
+  job.runMode = null;
+  job.runId = null;
+  job.queueRunId = null;
+  job.queuedMode = null;
+  job.queuedAt = null;
+  job.child = null;
+  job.pendingUniformPassword = null;
+  stopMailPolling(job);
+  await writePasswordJson(passwordSetStatePath(job), job.passwordSet);
+  appendJobLog(job, `[password-set] ${job.prompt}。\n`);
+  touch(job);
+  await saveJobMetadata(job);
+  // 完成状态和凭据均已落盘后才能删除结果，避免重启丢失成功证据。
+  if (credentialsPersisted) await removePrivateFile(job.passwordAddResultPath);
+}
+
+async function restorePasswordSetOperations() {
+  for (const job of jobs.values()) {
+    if (job.passwordSet && job.lastOperationType === "set_password") {
+      await finishPasswordSet(job, "服务重启中断了密码设置，请重新输入统一密码后再发起", true);
+    }
+  }
 }
 
 async function startPasswordAdd(job, options = {}) {
@@ -1592,6 +1781,10 @@ function consumeOutput(job, rawText) {
   job.logs = `${job.logs}${text}`.slice(-MAX_LOG_CHARS);
   const scan = `${job.parserTail}${text}`;
   job.parserTail = scan.slice(-2_000);
+  if (job.runMode === "password_set" && scan.includes("[password-set-submitted]")) {
+    job.passwordSet.state = "submitted";
+    void saveJobMetadata(job).catch(() => {});
+  }
   if (job.runMode === "logout_all" && scan.includes("[logout-all-requesting]")) {
     job.logout.state = "requesting";
     void saveJobMetadata(job).catch(() => {});
@@ -1614,7 +1807,7 @@ function consumeOutput(job, rawText) {
   }
 
   if (scan.includes("[proxy-risk-retry]")) {
-    if (job.runMode === "logout_all") return;
+    if (["logout_all", "password_set"].includes(job.runMode)) return;
     void restartAfterProxyRisk(job, {
       connectionFailure: scan.includes("PROXY_CONNECTION_RETRY"),
     }).catch((error) => {
@@ -1813,10 +2006,13 @@ function consumeOutput(job, rawText) {
   if (scan.includes("[ok] Account password added and saved securely")) {
     setStage(job, "finalizing", "密码已添加，正在安全保存新密码");
   }
+  if (scan.includes("[ok] Account password set and saved securely")) setStage(job, "finalizing", "新密码已设置，正在保存账号资料");
   const errorMatches = [...scan.matchAll(/\[error\]\s*([^\r\n]+)/g)];
   if (errorMatches.length) {
     const errorMessage = extractResponseMessage(errorMatches.at(-1)[1]);
-    if (job.runMode === "totp_setup") {
+    if (job.runMode === "password_set") {
+      job.passwordSetError = errorMessage;
+    } else if (job.runMode === "totp_setup") {
       job.totpSetupError = errorMessage;
     } else if (job.runMode === "password_add") {
       job.passwordAddError = errorMessage;
@@ -2381,7 +2577,18 @@ async function submitJobInput(job, body, options = {}) {
 }
 
 async function cancelJob(job) {
-  if (!isActive(job.status) && !isLogoutRunning(job)) return;
+  if (!isActive(job.status) && !isLogoutRunning(job) && !isPasswordSetRunning(job)) return;
+  if (isPasswordSetRunning(job)) {
+    const child = job.child;
+    job.runId = crypto.randomUUID();
+    job.queueRunId = null;
+    const exited = waitForChildExit(child, 3_000);
+    child?.kill("SIGTERM");
+    await exited;
+    await finishPasswordSet(job, "已取消本次统一密码设置");
+    scheduleQueuedJobs();
+    return;
+  }
   if (isLogoutRunning(job)) {
     const child = job.child;
     job.queueRunId = null;
@@ -2437,7 +2644,7 @@ async function cancelJob(job) {
 }
 
 async function cancelAllJobs() {
-  const activeJobs = [...jobs.values()].filter((job) => isActive(job.status) || isLogoutRunning(job));
+  const activeJobs = [...jobs.values()].filter((job) => isActive(job.status) || isLogoutRunning(job) || isPasswordSetRunning(job));
   if (!activeJobs.length) return 0;
   queueSchedulingPaused = true;
   try {
@@ -2973,6 +3180,7 @@ function isAutoRepairCoolingDown(job) {
 }
 
 function getAutoRepairEligibility(job) {
+  if (job.passwordSet?.state === "unknown") return { eligible: false, reason: "统一密码设置结果待核实，请先确认账号密码" };
   if (job.autoRepairPaused) return { eligible: false, reason: "登出操作已暂停自动重登，需要手动恢复" };
   if (job.autoRepairBlocked) return { eligible: false, reason: "账号已确认封禁、删除或永久停用" };
   if (!job.lastAuthAutomated) return { eligible: false, reason: job.lastAuthAutomationReason || "上次授权不是全自动完成" };
@@ -3143,6 +3351,10 @@ function publicJob(job) {
     canDownload: Boolean(job.resultSaved),
     loginMode: job.loginMode || (job.mailApiUrl ? "email_otp" : "manual"),
     hasTotpKey: Boolean(job.totpSecret || job.hasTotpCredential),
+    missingCredentials: [
+      ...(job.hasPasswordCredential && !job.password ? ["原密码"] : []),
+      ...(job.hasTotpCredential && !job.totpSecret ? ["2FA 密钥"] : []),
+    ],
     autoEmailOtp: Boolean(job.mailApiUrl),
     mailStatus: job.mailStatus,
     mailApiError: job.mailApiError,
@@ -3153,6 +3365,9 @@ function publicJob(job) {
     totpSetupError: job.totpSetupError || null,
     passwordAddError: job.passwordAddError || null,
     passwordAddedAt: job.passwordAddedAt || null,
+    passwordSetError: job.passwordSetError || null,
+    passwordSetState: job.passwordSet?.state || null,
+    canSetPassword: canSetPassword(job),
     smsProviderId: job.smsProviderId,
     smsProviderName: job.smsProviderName,
     smsServiceLabel: job.smsServiceLabel,
@@ -3193,15 +3408,18 @@ function publicSelectionJob(job) {
     canForceRelogin: canForceRelogin(job),
     canSetupTotp: canSetupTotp(job),
     canAddPassword: canAddPassword(job),
+    canSetPassword: canSetPassword(job),
   };
 }
 
 function canForceRelogin(job) {
+  if (isPasswordSetRunning(job)) return false;
   if (isLogoutRunning(job)) return false;
   return ["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status);
 }
 
 function canSetupTotp(job) {
+  if (isPasswordSetRunning(job)) return false;
   if (isLogoutRunning(job)) return false;
   if (job.totpSecret || job.hasTotpCredential || job.totpKnownEnabled) return false;
   if (job.status === "completed" && job.resultSaved) return true;
@@ -3210,6 +3428,7 @@ function canSetupTotp(job) {
 }
 
 function canAddPassword(job) {
+  if (isPasswordSetRunning(job)) return false;
   if (isLogoutRunning(job)) return false;
   if (job.password || job.hasPasswordCredential) return false;
   if (job.status === "completed" && job.resultSaved) return true;
@@ -3402,6 +3621,7 @@ function resolveSelectedJobs(ids) {
 async function deleteJobsByEmail(email) {
   const matching = [...jobs.values()].filter((job) => job.email.toLowerCase() === email);
   if (matching.some(isLogoutRunning)) throw httpError(409, "登出操作尚未结束，请先等待结果或取消操作");
+  if (matching.some(isPasswordSetRunning)) throw httpError(409, "统一密码设置尚未结束，请先等待结果或取消操作");
   const directories = new Set();
   const childWaits = [];
   matching.forEach((job) => {
@@ -3520,6 +3740,8 @@ async function syncCompletedOutputs(force = false) {
           ...restoredTotpSetupState(metadata, storedCredentials),
           ...restoredProxyRiskState(metadata),
           ...restoredAutoRepairState(metadata),
+          passwordSet: metadata.password_set || null,
+          passwordSetError: metadata.password_set?.error || null,
           totpSetupError: restoredOperation.totpSetupError,
           passwordAddError: restoredOperation.passwordAddError,
           passwordAddedAt: metadata.password_added_at || passwordRecovery.addedAt || null,
@@ -3613,6 +3835,8 @@ async function syncCompletedOutputs(force = false) {
           ...restoredTotpSetupState(metadata, storedCredentials),
           ...restoredProxyRiskState(metadata),
           ...restoredAutoRepairState(metadata),
+          passwordSet: metadata.password_set || null,
+          passwordSetError: metadata.password_set?.error || null,
           totpSetupError: totpRecovery.error || null,
           passwordAddError: passwordRecovery.error || metadata.password_add_error || null,
           passwordAddedAt: metadata.password_added_at || passwordRecovery.addedAt || null,
@@ -3635,7 +3859,7 @@ async function syncCompletedOutputs(force = false) {
         const storedCredentialsMissing = missingStoredCredentials.length > 0;
         const savedStatus = String(metadata.status || "");
         const restartable = ["queued", "starting"].includes(savedStatus)
-          && !metadata.auto_repair_paused && metadata.queued_mode !== "logout_all";
+          && !metadata.auto_repair_paused && !["logout_all", "password_set"].includes(metadata.queued_mode);
         const interrupted = Boolean(savedStatus) && !isTerminalStatus(savedStatus) && !restartable;
         const restoredStatus = storedCredentialsMissing && restartable
           ? "reauth_required"
@@ -3709,6 +3933,8 @@ async function syncCompletedOutputs(force = false) {
           ...restoredTotpSetupState(metadata, storedCredentials),
           ...restoredProxyRiskState(metadata),
           ...restoredAutoRepairState(metadata),
+          passwordSet: metadata.password_set || null,
+          passwordSetError: metadata.password_set?.error || null,
           passwordAddError: metadata.password_add_error || null,
           passwordAddedAt: metadata.password_added_at || null,
           pendingNewPassword: null,
@@ -3766,6 +3992,10 @@ async function recoverAddedPasswordCredential({ email, resultPath, credentials }
   } catch (error) {
     if (error?.code === "ENOENT") return { credentials, recovered: false, error: null, addedAt: null };
     return { credentials, recovered: false, error: `添加密码结果文件无法读取：${error.message}`, addedAt: null };
+  }
+  // 统一改密结果必须按操作编号核对，由 restorePasswordSetOperations 统一恢复。
+  if (result && (Object.hasOwn(result, "operationId") || Object.hasOwn(result, "confirmed"))) {
+    return { credentials, recovered: false, error: null, addedAt: null };
   }
   if (
     result?.version !== 1
@@ -4424,6 +4654,7 @@ function escapeRegExp(value) {
 }
 
 async function updateJobCredentials(job, credentials, options = {}) {
+  if (isPasswordSetRunning(job)) throw httpError(409, "统一密码设置进行中，暂不能更新账号资料");
   if (isLogoutRunning(job)) throw httpError(409, "登出操作进行中，暂不能更新账号资料");
   if (credentials.preserveExistingCredentials) await reloadMissingJobCredentials(job);
   const normalized = credentials.preserveExistingCredentials
@@ -4467,6 +4698,7 @@ async function updateJobCredentials(job, credentials, options = {}) {
 }
 
 async function updateJobProxy(job, proxyUrl) {
+  if (isPasswordSetRunning(job)) throw httpError(409, "统一密码设置进行中，暂不能更新代理配置");
   if (isLogoutRunning(job)) throw httpError(409, "登出操作进行中，暂不能更新代理配置");
   if (job.proxyUrl === proxyUrl) return;
   job.proxyUrl = proxyUrl;
@@ -4531,6 +4763,7 @@ async function saveJobMetadata(job) {
         totp_known_enabled: Boolean(job.totpKnownEnabled || job.totpSecret || job.hasTotpCredential),
         password_add_error: job.passwordAddError || null,
         password_added_at: job.passwordAddedAt || null,
+        password_set: job.passwordSet || null,
         login_checkpoint_available: Boolean(job.loginCheckpointAvailable),
         proxy_risk_retry_count: Number(job.proxyRiskRetryCount || 0),
         proxy_connection_failure_count: Number(job.proxyConnectionFailureCount || 0),
@@ -4816,7 +5049,7 @@ async function shutdown() {
       ...sub2ApiRequestPromises,
       ...sub2ApiAutoRepairPromises,
     ].filter(Boolean));
-    const activeJobs = [...jobs.values()].filter((job) => isActive(job.status) || isLogoutRunning(job));
+    const activeJobs = [...jobs.values()].filter((job) => isActive(job.status) || isLogoutRunning(job) || isPasswordSetRunning(job));
     const childWaits = activeJobs
       .map((job) => job.child)
       .filter(Boolean)

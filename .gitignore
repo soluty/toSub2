@@ -12,3 +12,14 @@ chatgpt-protocol-session.json
 sub2api-import*.json
 login-checkpoint.json
 job-meta.json
+# 本机明文凭据和操作结果（包含自定义运行目录及原子写入临时文件）
+.credentials/
+credentials.json
+.credentials.*.tmp
+password-add-result.json
+password-add-result.json.*.tmp
+password-set-state.json
+password-set-state.json.*.tmp
+totp-setup-result.json
+totp-setup-result.json.*.tmp
+sub2api-monitor.json

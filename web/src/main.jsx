@@ -33,6 +33,7 @@ import {
   X,
 } from "lucide-react";
 import "./styles.css";
+import { validateAccountPassword } from "../../src/password-policy.mjs";
 
 const POLL_INTERVAL_MS = 900;
 const LUBAN_API_KEY_STORAGE_KEY = "chatgpt-onboarding.luban-api-key";
@@ -74,6 +75,7 @@ function App() {
   const [selectedJobIds, setSelectedJobIds] = useState(() => new Set());
   const [jobSelectionIndex, setJobSelectionIndex] = useState([]);
   const [batchAction, setBatchAction] = useState("");
+  const [passwordBatchTargets, setPasswordBatchTargets] = useState(null);
   const [page, setPage] = useState(1);
   const [pagination, setPagination] = useState({ page: 1, pageSize: 20, total: 0, totalPages: 1 });
   const [stats, setStats] = useState({ active: 0, queued: 0, completed: 0 });
@@ -222,6 +224,9 @@ function App() {
   const passwordAddSelectedCount = selectedJobs.filter((job) => job.canAddPassword).length;
   const canAddPasswordSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
     && passwordAddSelectedCount > 0;
+  const passwordSetSelectedCount = selectedJobs.filter((job) => job.canSetPassword).length;
+  const canSetPasswordSelected = selectedJobs.length > 0 && selectedJobs.length === selectedJobIds.size
+    && passwordSetSelectedCount > 0;
 
   function openSmsSettings() {
     const draft = withSmsProviderDefaults(smsProviderDefinitions, smsSettings);
@@ -622,6 +627,22 @@ function App() {
     }
   }
 
+  async function setPasswordSelected(password) {
+    setBatchAction("set-password");
+    try {
+      const data = await apiFetch(token, "/api/jobs/set-password-batch", {
+        method: "POST",
+        body: JSON.stringify({ ids: passwordBatchTargets.ids, password, proxyUrl: accountProxyUrl.trim() }),
+      });
+      setUploadNotice(`已开始为 ${data.started} 个账号设置统一密码${data.skipped ? `，跳过 ${data.skipped} 个当前不可操作的账号` : ""}${data.failures?.length ? `，${data.failures.length} 个账号启动失败：${data.failures[0].error}` : ""}`);
+      setSelectedJobIds(new Set());
+      setPasswordBatchTargets(null);
+      setError("");
+    } finally {
+      setBatchAction("");
+    }
+  }
+
   async function forceReloginSelected() {
     if (!canForceReloginSelected || batchAction) return;
     const skipped = selectedJobIds.size - forceReloginSelectedCount;
@@ -926,6 +947,14 @@ function App() {
                 <button type="button" className="secondary-button bulk-button" onClick={addPasswordSelected} disabled={!canAddPasswordSelected || Boolean(batchAction)}>
                   {batchAction === "add-password" ? <LoaderCircle className="spin" size={16} /> : <KeyRound size={16} />}
                   批量添加密码
+                </button>
+              )}
+              {features.passwordSet && (
+                <button type="button" className="secondary-button bulk-button"
+                  onClick={() => setPasswordBatchTargets({ ids: [...selectedJobIds], count: passwordSetSelectedCount })}
+                  disabled={!canSetPasswordSelected || Boolean(batchAction)}>
+                  {batchAction === "set-password" ? <LoaderCircle className="spin" size={16} /> : <KeyRound size={16} />}
+                  批量设置统一密码
                 </button>
               )}
               <button type="button" className="delete-button" onClick={deleteSelected} disabled={!selectedJobIds.size || Boolean(batchAction)}>
@@ -1391,6 +1420,7 @@ function App() {
           </form>
         </div>
       )}
+      {passwordBatchTargets && <BatchPasswordDialog targets={passwordBatchTargets} onSubmit={setPasswordSelected} onClose={() => setPasswordBatchTargets(null)} />}
       {batchOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
           if (event.target === event.currentTarget && !batchBusy) setBatchOpen(false);
@@ -1465,6 +1495,58 @@ function App() {
         </div>
       )}
     </main>
+  );
+}
+
+function BatchPasswordDialog({ targets, onSubmit, onClose }) {
+  const dialog = useRef(null);
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    const element = dialog.current;
+    element.showModal();
+    return () => element.close();
+  }, []);
+
+  async function submit(event) {
+    event.preventDefault();
+    if (busy) return;
+    setError("");
+    try {
+      validateAccountPassword(password);
+      setBusy(true);
+      await onSubmit(password);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <dialog ref={dialog} className="batch-dialog password-batch-dialog" aria-labelledby="password-batch-title"
+      onCancel={(event) => { if (busy) event.preventDefault(); else onClose(); }}>
+      <form onSubmit={submit}>
+        <div className="dialog-header">
+          <div><h2 id="password-batch-title">批量设置统一密码</h2></div>
+          <button type="button" className="icon-button" onClick={onClose} disabled={busy} aria-label="关闭"><X size={18} /></button>
+        </div>
+        <p>为 {targets.count} 个账号设置同一个密码。没有密码的账号会添加密码，已有密码的账号会改为新密码。</p>
+        {targets.ids.length > targets.count && <p className="password-batch-hint">另有 {targets.ids.length - targets.count} 个账号当前不可操作，将跳过。</p>}
+        <label className="batch-label" htmlFor="batch-new-password">新密码</label>
+        <input id="batch-new-password" type="password" value={password} onChange={(event) => { setPassword(event.target.value); setError(""); }}
+          autoComplete="new-password" minLength={12} maxLength={128} required autoFocus disabled={busy} aria-describedby="batch-password-hint" />
+        <p id="batch-password-hint" className="password-batch-hint">12–128 个字符，包含大写字母、小写字母、数字和符号。</p>
+        {error && <div className="dialog-error" role="alert">{error}</div>}
+        <div className="dialog-footer">
+          <button type="button" className="cancel-button" onClick={onClose} disabled={busy}>取消</button>
+          <button type="submit" className="primary-button" disabled={busy || !password}>
+            {busy ? <LoaderCircle className="spin" size={16} /> : <KeyRound size={16} />}确认设置
+          </button>
+        </div>
+      </form>
+    </dialog>
   );
 }
 
@@ -1678,6 +1760,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
         )}
         {job.totpSetupError && <div className="row-error">2FA：{extractResponseMessage(job.totpSetupError)}</div>}
         {job.passwordAddError && <div className="row-error">添加密码：{extractResponseMessage(job.passwordAddError)}</div>}
+        {job.passwordSetError && <div className="row-error">统一密码：{extractResponseMessage(job.passwordSetError)}</div>}
         {job.autoRepairPaused && <div className="security-paused"><ShieldCheck size={13} />自动重登已暂停</div>}
         {job.mailApiError && job.status === "email_otp" && <div className="mail-error">{job.mailApiError}</div>}
         {job.currentPhone && ["working", "phone", "phone_otp"].includes(job.status) && (
@@ -1861,6 +1944,7 @@ function StatusBadge({ status }) {
     mfa_otp: ["待 2FA", <ShieldCheck size={14} />],
     totp_starting: ["准备 2FA", <LoaderCircle className="spin" size={14} />],
     password_add_starting: ["准备密码", <LoaderCircle className="spin" size={14} />],
+    password_set_starting: ["设置密码", <LoaderCircle className="spin" size={14} />],
     logout_starting: ["准备登出", <LoaderCircle className="spin" size={14} />],
     totp_setup_otp: ["激活 2FA", <ShieldCheck size={14} />],
     email_otp: ["待邮箱码", <Mail size={14} />],
@@ -1878,6 +1962,11 @@ function StatusBadge({ status }) {
 }
 
 function LoginMethodBadge({ job }) {
+  if (job.missingCredentials?.length) {
+    return <span className="mail-mode error" title="当前只有曾配置凭据的标记，实际凭据无法读取。请通过批量添加重新导入原账号资料。">
+      <CircleAlert size={12} />缺少{job.missingCredentials.join("、")}
+    </span>;
+  }
   if (job.loginMode === "password") {
     const methods = ["密码", job.autoEmailOtp ? "自动收码" : "", job.hasTotpKey ? "2FA" : ""].filter(Boolean);
     return (
@@ -2043,6 +2132,7 @@ function operationLabel(type) {
     resume: "继续中断流程",
     setup_2fa: "设置 2FA",
     add_password: "添加密码",
+    set_password: "设置统一密码",
     logout_all: "登出所有设备",
     account_update: "更新账号资料",
     proxy_update: "更新代理 IP",
