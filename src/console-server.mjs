@@ -21,6 +21,8 @@ import { LOGOUT_RESULT_FILENAME, readLogoutResult, writeLogoutResult } from "./a
 import { validateAccountPassword } from "./password-policy.mjs";
 import { PASSWORD_SET_STATE_FILENAME, readPasswordState, writePasswordJson } from "./password-set.mjs";
 import { TOTP_ROTATE_STATE_FILENAME, TOTP_ROTATE_RESULT_FILENAME, readTotpRotationJson, writeTotpRotationJson } from "./totp-rotate.mjs";
+import { normalizeAnnotationsPatch, restoreAnnotations, mergeAnnotations, effectiveAccountType,
+  normalizeAccountFilters, matchesAccountFilters, accountFacets, observedAccountType } from "./account-annotations.mjs";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 4399;
@@ -223,6 +225,7 @@ async function handleApi(req, res, requestUrl) {
         bulkActions: true,
         pagination: true,
         uniqueEmail: true,
+        accountAnnotations: true,
         smsProviders: publicSmsProviderDefinitions(),
         queue: true,
         sourceExport: true,
@@ -255,7 +258,27 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/query") {
     const body = await readJson(req);
     const requestedPage = Math.max(1, Number.parseInt(body.page || "1", 10) || 1);
-    await sendJobsPage(res, requestedPage, normalizeEmailFilter(body.emails));
+    const emails = Object.hasOwn(body, "emails") ? normalizeEmailFilter(body.emails) : null;
+    if (!emails && !Object.hasOwn(body, "filters")) throw httpError(400, "请提供邮箱或账号筛选条件");
+    await sendJobsPage(res, requestedPage, emails, normalizeAccountFilters(body.filters));
+    return;
+  }
+
+  if (req.method === "POST" && requestUrl.pathname === "/api/jobs/annotations") {
+    const body = await readJson(req);
+    const selected = resolveSelectedJobs(body.ids);
+    const patch = normalizeAnnotationsPatch(body.annotations);
+    if (!Object.keys(patch).length) throw httpError(400, "请至少修改一项账号标记");
+    const tagsMode = body.tagsMode || "replace";
+    if (!["append", "replace"].includes(tagsMode)) throw httpError(400, "标签更新方式不正确");
+    const failures = [];
+    const updated = await Promise.all(selected.map(job => withEmailJobLock(job.email, async () => {
+      try { await updateJobAnnotations(job, patch, tagsMode); return job; }
+      catch (error) { failures.push({ id: job.id, error: error.message, status: error.status || 500 }); return null; }
+    })));
+    const succeeded = updated.filter(Boolean);
+    if (!succeeded.length) throw httpError(failures[0]?.status || 500, failures[0]?.error || "账号标记保存失败");
+    sendJson(res, 200, { updated: succeeded.length, failures, jobs: succeeded.map(publicJob) });
     return;
   }
 
@@ -280,6 +303,7 @@ async function handleApi(req, res, requestUrl) {
       return;
     }
     const hasCredentialUpdate = ["password", "mailApiUrl", "mailRequestBody", "totpSecret"].some((key) => Object.hasOwn(body, key));
+    const annotations = normalizeAnnotationsPatch(body.annotations);
     const credentials = normalizeLoginCredentials(body);
     const hasProxyUpdate = Object.hasOwn(body, "proxyUrl");
     const proxyUrl = hasProxyUpdate ? normalizeProxyUrl(body.proxyUrl) : null;
@@ -288,9 +312,10 @@ async function handleApi(req, res, requestUrl) {
       if (existing) {
         if (hasCredentialUpdate) await updateJobCredentials(existing, credentials, { proxyUrl, hasProxyUpdate });
         else if (hasProxyUpdate) await updateJobProxy(existing, proxyUrl);
-        return { job: existing, created: false, updated: hasCredentialUpdate || hasProxyUpdate };
+        if (Object.keys(annotations).length) await updateJobAnnotations(existing, annotations);
+        return { job: existing, created: false, updated: hasCredentialUpdate || hasProxyUpdate || Object.keys(annotations).length > 0 };
       }
-      return { job: await startJob(email, credentials, proxyUrl), created: true, updated: false };
+      return { job: await startJob(email, credentials, proxyUrl, annotations), created: true, updated: false };
     });
     sendJson(res, result.created ? 201 : 200, { ...result, job: publicJob(result.job) });
     return;
@@ -299,14 +324,22 @@ async function handleApi(req, res, requestUrl) {
   if (req.method === "POST" && requestUrl.pathname === "/api/jobs/batch") {
     const body = await readJson(req);
     const entries = parseBatchEntries(body.text, mailRequestConfig);
+    const sharedAnnotations = normalizeAnnotationsPatch(body.annotations);
+    entries.forEach(entry => { entry.annotations = { ...sharedAnnotations, ...entry.annotations }; });
     const proxyUrl = normalizeProxyUrl(body.proxyUrl);
+    const hasProxyUpdate = Object.hasOwn(body, "proxyUrl");
     const results = await Promise.all(entries.map((entry) => withEmailJobLock(entry.email, async () => {
       const existing = findJobByEmail(entry.email);
       if (existing) {
-        await updateJobCredentials(existing, entry, { proxyUrl, hasProxyUpdate: true });
+        if (!entry.annotationsOnly) {
+          const credentials = entry.credentialPatch ? { password: existing.password, totpSecret: existing.totpSecret,
+            mailApiUrl: existing.mailApiUrl, mailRequestBody: existing.mailRequestBody, ...entry.credentialPatch } : entry;
+          await updateJobCredentials(existing, credentials, { proxyUrl, hasProxyUpdate });
+        }
+        if (Object.keys(entry.annotations).length) await updateJobAnnotations(existing, entry.annotations);
         return { job: existing, updated: true };
       }
-      return { job: await startJob(entry.email, entry, proxyUrl), updated: false };
+      return { job: await startJob(entry.email, entry, proxyUrl, entry.annotations), updated: false };
     })));
     sendJson(res, 201, {
       jobs: results.map((item) => publicJob(item.job)),
@@ -700,13 +733,11 @@ async function handleApi(req, res, requestUrl) {
   sendJson(res, 405, { error: "Method not allowed" });
 }
 
-async function sendJobsPage(res, requestedPage, emailFilter = null) {
+async function sendJobsPage(res, requestedPage, emailFilter = null, filters = {}) {
   await syncCompletedOutputs();
   const allJobs = listUniqueJobs();
   const emailSet = emailFilter?.length ? new Set(emailFilter) : null;
-  const visibleJobs = emailSet
-    ? allJobs.filter((job) => emailSet.has(job.email.toLowerCase()))
-    : allJobs;
+  const visibleJobs = allJobs.filter(job => (!emailSet || emailSet.has(job.email.toLowerCase())) && matchesAccountFilters(job, filters));
   const total = visibleJobs.length;
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const page = Math.min(requestedPage, totalPages);
@@ -715,7 +746,8 @@ async function sendJobsPage(res, requestedPage, emailFilter = null) {
     jobs: visibleJobs.slice(start, start + PAGE_SIZE).map(publicJob),
     selection: visibleJobs.map(publicSelectionJob),
     pagination: { page, pageSize: PAGE_SIZE, total, totalPages, totalAll: allJobs.length },
-    filter: { active: Boolean(emailSet), requested: emailFilter?.length || 0, matched: total },
+    filter: { active: Boolean(emailSet) || Object.keys(filters).length > 0, requested: emailFilter?.length || 0, matched: total },
+    facets: accountFacets(allJobs),
     stats: {
       active: allJobs.filter(occupiesActiveSlot).length,
       queued: allJobs.filter((job) => job.status === "queued").length,
@@ -736,7 +768,7 @@ function normalizeEmailFilter(value) {
   return [...unique];
 }
 
-async function startJob(email, credentials = {}, proxyUrl = null) {
+async function startJob(email, credentials = {}, proxyUrl = null, annotations = {}) {
   const { loginMode, mailApiUrl, mailRequestBody, password, totpSecret } = normalizeLoginCredentials(credentials);
   await saveStoredLoginCredentials(email, { password, totpSecret, proxyUrl });
   const id = crypto.randomUUID();
@@ -751,6 +783,8 @@ async function startJob(email, credentials = {}, proxyUrl = null) {
   const job = {
     id,
     email,
+    annotations: restoreAnnotations(annotations),
+    observedAccountType: "",
     status: "queued",
     prompt: "已加入任务队列",
     createdAt,
@@ -1063,6 +1097,10 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
     return;
   }
   if (code === 0 && job.resultSaved && (await fileExists(job.outputPath))) {
+    try {
+      const data = JSON.parse(await fs.readFile(job.outputPath, "utf8"));
+      job.observedAccountType = observedAccountType(data.accounts?.[0]);
+    } catch { job.observedAccountType = ""; }
     if (mode === "full") completeAuthorizationAutomationAttempt(job);
     job.loginCheckpointAvailable = false;
     job.status = "completed";
@@ -3581,6 +3619,9 @@ function publicJob(job) {
   return {
     id: job.id,
     email: job.email,
+    annotations: restoreAnnotations(job.annotations),
+    accountType: effectiveAccountType(job),
+    accountTypeSource: job.annotations?.type ? "manual" : job.observedAccountType ? "authorization" : "unset",
     status: job.status,
     prompt: job.status === "queued"
       ? `排队中，前方还有 ${Math.max(0, getQueuePosition(job) - 1)} 条任务`
@@ -3649,6 +3690,7 @@ function publicSelectionJob(job) {
   return {
     id: job.id,
     email: job.email,
+    accountType: effectiveAccountType(job),
     status: job.status,
     canDownload: Boolean(job.resultSaved),
     canRetry: !isLogoutRunning(job) && !isTotpRotationBlocked(job) && ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
@@ -3993,6 +4035,8 @@ async function syncCompletedOutputs(force = false) {
           runMode: null,
           fallbackInProgress: false,
           ...restoredTotpSetupState(metadata, storedCredentials),
+          annotations: restoreAnnotations(metadata.account_annotations),
+          observedAccountType: observedAccountType(account),
           ...restoredProxyRiskState(metadata),
           ...restoredAutoRepairState(metadata),
           passwordSet: metadata.password_set || null,
@@ -4089,6 +4133,8 @@ async function syncCompletedOutputs(force = false) {
           runMode: null,
           fallbackInProgress: false,
           ...restoredTotpSetupState(metadata, storedCredentials),
+          annotations: restoreAnnotations(metadata.account_annotations),
+          observedAccountType: restoredObservedAccountType(metadata),
           ...restoredProxyRiskState(metadata),
           ...restoredAutoRepairState(metadata),
           passwordSet: metadata.password_set || null,
@@ -4187,6 +4233,8 @@ async function syncCompletedOutputs(force = false) {
             : "正在建立登录会话",
           fallbackInProgress: false,
           ...restoredTotpSetupState(metadata, storedCredentials),
+          annotations: restoreAnnotations(metadata.account_annotations),
+          observedAccountType: restoredObservedAccountType(metadata),
           ...restoredProxyRiskState(metadata),
           ...restoredAutoRepairState(metadata),
           passwordSet: metadata.password_set || null,
@@ -4523,6 +4571,36 @@ function normalizeTotpSecret(value, lineNumber = null) {
   return normalized;
 }
 
+function restoredObservedAccountType(metadata) {
+  return observedAccountType({ extra: { chatgpt_plan_type: metadata.observed_account_type } });
+}
+
+function parseAnnotatedAccountLine(line, lineNumber) {
+  if (!line.startsWith("{")) return null;
+  let data;
+  try { data = JSON.parse(line); }
+  catch {
+    if (/^\{\s*"(?:email|annotations|password)"\s*:/.test(line)) throw httpError(400, `第 ${lineNumber} 行 JSON 格式不正确`);
+    return null;
+  }
+  if (!data || typeof data !== "object" || Array.isArray(data) || !isEmail(data.email)) throw httpError(400, `第 ${lineNumber} 行 JSON 需要有效的 email 字段`);
+  const credentialFields = ["password", "mailApiUrl", "mailRequestBody", "totpSecret"];
+  const allowed = new Set(["email", "annotations", ...credentialFields]);
+  if (Object.keys(data).some(key => !allowed.has(key))) throw httpError(400, `第 ${lineNumber} 行 JSON 含不支持的字段`);
+  const credentialPatch = {};
+  for (const key of credentialFields) {
+    if (Object.hasOwn(data, key)) {
+      if (typeof data[key] !== "string") throw httpError(400, `第 ${lineNumber} 行登录资料需为文本`);
+      credentialPatch[key] = data[key];
+    }
+  }
+  let annotations;
+  try { annotations = normalizeAnnotationsPatch(data.annotations); }
+  catch (error) { throw httpError(400, `第 ${lineNumber} 行：${error.message}`); }
+  return { email: data.email.trim(), ...normalizeLoginCredentials(data), annotations, credentialPatch,
+    annotationsOnly: Object.keys(credentialPatch).length === 0, preserveExistingCredentials: Object.keys(credentialPatch).length === 0 };
+}
+
 function parseBatchEntries(value, requestConfig = {}) {
   const lines = String(value || "")
     .split(/\r?\n/)
@@ -4532,9 +4610,9 @@ function parseBatchEntries(value, requestConfig = {}) {
   if (lines.length > MAX_BATCH_JOBS) throw httpError(400, `一次最多添加 ${MAX_BATCH_JOBS} 条任务`);
 
   const entries = lines.map((line, index) => (
-    requestConfig.method === "POST" && !isEmail(line)
+    parseAnnotatedAccountLine(line, index + 1) || (requestConfig.method === "POST" && !isEmail(line)
       ? parsePostMailAccountLine(line, index + 1, requestConfig)
-      : parseSmartAccountLine(line, index + 1)
+      : parseSmartAccountLine(line, index + 1))
   ));
 
   const unique = new Map();
@@ -5005,6 +5083,17 @@ function restartJobAfterConfigurationUpdate(job) {
   enqueueJob(job, "full", "账号资料已更新，正在重新建立登录会话");
 }
 
+async function updateJobAnnotations(job, patch, tagsMode = "replace") {
+  const previous = job.annotations;
+  job.annotations = mergeAnnotations(previous, patch, tagsMode);
+  try { await saveJobMetadata(job); }
+  catch {
+    job.annotations = previous;
+    throw httpError(500, "账号标记未能保存，请检查本机数据目录后重试");
+  }
+  touch(job);
+}
+
 async function saveJobMetadata(job) {
   if (job.deleted) return;
   job.metadataWritePromise = (job.metadataWritePromise || Promise.resolve())
@@ -5015,6 +5104,8 @@ async function saveJobMetadata(job) {
       const data = {
         version: 1,
         email: job.email,
+        account_annotations: restoreAnnotations(job.annotations),
+        observed_account_type: job.observedAccountType || "",
         status: job.status,
         prompt: job.prompt || null,
         last_error: job.lastError || null,

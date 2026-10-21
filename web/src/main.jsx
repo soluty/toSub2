@@ -13,6 +13,7 @@ import {
   ExternalLink,
   FileText,
   Filter,
+  Folder,
   Globe2,
   KeyRound,
   ListPlus,
@@ -29,11 +30,18 @@ import {
   ShieldCheck,
   Smartphone,
   PhoneIncoming,
+  Pencil,
+  Search,
+  Tags,
   Trash2,
   X,
 } from "lucide-react";
 import "./styles.css";
 import { validateAccountPassword } from "../../src/password-policy.mjs";
+import { ACCOUNT_TYPES, normalizeAnnotationsPatch } from "../../src/account-annotations.mjs";
+
+const EMPTY_ANNOTATION_FORM = { type: "", group: "", tags: "", note: "" };
+const EMPTY_ACCOUNT_FILTERS = { type: "", group: null, tag: "", search: "" };
 
 const POLL_INTERVAL_MS = 900;
 const LUBAN_API_KEY_STORAGE_KEY = "chatgpt-onboarding.luban-api-key";
@@ -66,6 +74,12 @@ function App() {
   const [batchText, setBatchText] = useState("");
   const [batchBusy, setBatchBusy] = useState(false);
   const [batchError, setBatchError] = useState("");
+  const [batchAnnotations, setBatchAnnotations] = useState({ ...EMPTY_ANNOTATION_FORM });
+  const [annotationTargets, setAnnotationTargets] = useState(null);
+  const [accountFilters, setAccountFilters] = useState({ ...EMPTY_ACCOUNT_FILTERS });
+  const [accountSearch, setAccountSearch] = useState("");
+  const [accountFacets, setAccountFacets] = useState({ total: 0, groups: [], tags: [], types: {} });
+  const [refreshVersion, setRefreshVersion] = useState(0);
   const [filterOpen, setFilterOpen] = useState(false);
   const [filterText, setFilterText] = useState("");
   const [filterError, setFilterError] = useState("");
@@ -111,6 +125,17 @@ function App() {
   });
   const [uploadNotice, setUploadNotice] = useState("");
   const [accountProxyUrl, setAccountProxyUrl] = useState(() => readLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY));
+  const hasAccountFilters = Boolean(accountFilters.type || accountFilters.group !== null || accountFilters.tag || accountFilters.search);
+
+  useEffect(() => {
+    if (accountSearch.trim() === accountFilters.search) return undefined;
+    const timer = window.setTimeout(() => {
+      setAccountFilters(current => current.search === accountSearch.trim() ? current : { ...current, search: accountSearch.trim() });
+      setPage(1);
+      setSelectedJobIds(new Set());
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [accountSearch]);
 
   useEffect(() => writeLocalJson(SMS_PROVIDER_SETTINGS_KEY, smsSettings), [smsSettings]);
   useEffect(() => writeLocalJson(MAIL_REQUEST_SETTINGS_KEY, mailRequestSettings), [mailRequestSettings]);
@@ -147,10 +172,15 @@ function App() {
     let timer;
     const poll = async () => {
       try {
-        const data = emailFilter.length
+        const data = emailFilter.length || hasAccountFilters
           ? await apiFetch(token, "/api/jobs/query", {
               method: "POST",
-              body: JSON.stringify({ page, emails: emailFilter }),
+              body: JSON.stringify({ page, ...(emailFilter.length ? { emails: emailFilter } : {}), filters: {
+                ...(accountFilters.type ? { type: accountFilters.type } : {}),
+                ...(accountFilters.group !== null ? { group: accountFilters.group } : {}),
+                ...(accountFilters.tag ? { tag: accountFilters.tag } : {}),
+                ...(accountFilters.search ? { search: accountFilters.search } : {}),
+              } }),
             })
           : await apiFetch(token, `/api/jobs?page=${page}`);
         if (!stopped) {
@@ -158,6 +188,7 @@ function App() {
           setJobSelectionIndex(data.selection || data.jobs);
           setPagination(data.pagination || { page, pageSize: 20, total: data.jobs.length, totalPages: 1 });
           setStats(data.stats || { active: 0, queued: 0, completed: 0 });
+          if (data.facets) setAccountFacets(data.facets);
           if (data.pagination?.page && data.pagination.page !== page) setPage(data.pagination.page);
           setError("");
         }
@@ -172,7 +203,7 @@ function App() {
       stopped = true;
       window.clearTimeout(timer);
     };
-  }, [token, page, emailFilter]);
+  }, [token, page, emailFilter, accountFilters, refreshVersion]);
 
   useEffect(() => {
     if (!token || !features.sub2apiMonitor) return undefined;
@@ -466,6 +497,29 @@ function App() {
     setExpandedJobId(null);
   }, [page]);
 
+  function changeAccountFilter(field, value) {
+    setAccountFilters(current => ({ ...current, [field]: value }));
+    setSelectedJobIds(new Set());
+    setExpandedJobId(null);
+    setPage(1);
+  }
+
+  function clearAccountFilters() {
+    setAccountSearch("");
+    setAccountFilters({ ...EMPTY_ACCOUNT_FILTERS });
+    setSelectedJobIds(new Set());
+    setPage(1);
+  }
+
+  async function saveAnnotations(annotations, tagsMode) {
+    const data = await apiFetch(token, "/api/jobs/annotations", {
+      method: "POST", body: JSON.stringify({ ids: annotationTargets.ids, annotations, tagsMode }),
+    });
+    setUploadNotice(`已保存 ${data.updated} 个账号的标记${data.failures?.length ? `；${data.failures.length} 个保存失败：${data.failures[0].error}` : ""}`);
+    setAnnotationTargets(null);
+    setRefreshVersion(version => version + 1);
+  }
+
   async function createJob(event) {
     event.preventDefault();
     if (!email.trim() || busy) return;
@@ -478,6 +532,9 @@ function App() {
       setPage(1);
       if (page === 1) setJobs((current) => mergeJobs([data.job], current).slice(0, 20));
       setEmail("");
+      clearAccountFilters();
+      setEmailFilter([]);
+      setRefreshVersion(version => version + 1);
       setError("");
     } catch (requestError) {
       setError(requestError.message);
@@ -493,13 +550,19 @@ function App() {
     try {
       const data = await apiFetch(token, "/api/jobs/batch", {
         method: "POST",
-        body: JSON.stringify({ text: batchText, proxyUrl: accountProxyUrl.trim() }),
+        body: JSON.stringify({ text: batchText, proxyUrl: accountProxyUrl.trim(), annotations:
+          normalizeAnnotationsPatch(Object.fromEntries(Object.entries(batchAnnotations).filter(([, value]) => value.trim()))) }),
       });
       setPage(1);
       if (page === 1) setJobs((current) => mergeJobs(data.jobs, current).slice(0, 20));
       setBatchText("");
       setBatchError("");
       setBatchOpen(false);
+      setBatchAnnotations({ ...EMPTY_ANNOTATION_FORM });
+      clearAccountFilters();
+      setEmailFilter([]);
+      setRefreshVersion(version => version + 1);
+      setUploadNotice(`已新增 ${data.created} 个账号，更新 ${data.updated} 个账号；标记已保存`);
       setError("");
     } catch (requestError) {
       setBatchError(requestError.message);
@@ -758,7 +821,7 @@ function App() {
         <div className="section-heading">
           <div>
             <h2>授权任务</h2>
-            <p>{emailFilter.length
+            <p>{emailFilter.length || hasAccountFilters
               ? `匹配 ${pagination.total} 条，共 ${pagination.totalAll ?? pagination.total} 条任务`
               : (pagination.total ? `共 ${pagination.total} 条任务` : "添加邮箱后开始第一条任务")}</p>
           </div>
@@ -907,6 +970,39 @@ function App() {
           </div>
         )}
 
+        {features.accountAnnotations && (
+          <section className="account-organizer" aria-label="账号分组与筛选">
+            <div className="account-type-filters" aria-label="按账号类型筛选">
+              {[{ value: "", label: "全部账号" }, ...ACCOUNT_TYPES, { value: "unknown", label: "未标记" }].map(type => (
+                <button key={type.value} type="button" className={`account-type-filter ${accountFilters.type === type.value ? "active" : ""}`}
+                  aria-pressed={accountFilters.type === type.value} onClick={() => changeAccountFilter("type", type.value)}>
+                  {type.label}<span>{type.value ? accountFacets.types[type.value] || 0 : accountFacets.total}</span>
+                </button>
+              ))}
+            </div>
+            <div className="account-filter-controls">
+              <label><Folder size={15} /><span>分组</span>
+                <select aria-label="筛选本地分组" value={accountFilters.group === null ? "all" : JSON.stringify(accountFilters.group)}
+                  onChange={event => changeAccountFilter("group", event.target.value === "all" ? null : JSON.parse(event.target.value))}>
+                  <option value="all">全部分组</option>
+                  <option value={'""'}>未分组（{accountFacets.groups.find(group => !group.value)?.count || 0}）</option>
+                  {accountFacets.groups.filter(group => group.value).map(group => <option key={group.value} value={JSON.stringify(group.value)}>{group.value}（{group.count}）</option>)}
+                </select>
+              </label>
+              <label><Tags size={15} /><span>标签</span>
+                <select aria-label="筛选标签" value={accountFilters.tag} onChange={event => changeAccountFilter("tag", event.target.value)}>
+                  <option value="">全部标签</option>
+                  {accountFacets.tags.map(tag => <option key={tag.value} value={tag.value}>{tag.value}（{tag.count}）</option>)}
+                </select>
+              </label>
+              <label className="account-search"><Search size={16} />
+                <input aria-label="搜索邮箱、分组、标签或备注" placeholder="搜索邮箱、分组、标签、备注" value={accountSearch} onChange={event => setAccountSearch(event.target.value)} maxLength={200} />
+              </label>
+              {hasAccountFilters && <button type="button" className="selection-text-button" onClick={clearAccountFilters}>清除分类筛选</button>}
+            </div>
+          </section>
+        )}
+
         {features.bulkActions && jobs.length > 0 && (
           <div className="selection-toolbar">
             <div className="selection-summary">
@@ -919,6 +1015,12 @@ function App() {
               </button>
             </div>
             <div className="bulk-actions">
+              {features.accountAnnotations && (
+                <button type="button" className="secondary-button bulk-button" disabled={!selectedJobIds.size || Boolean(batchAction)}
+                  onClick={() => setAnnotationTargets({ ids: [...selectedJobIds], bulk: true })}>
+                  <Tags size={16} />批量标记
+                </button>
+              )}
               {features.cancelAll && (
                 <button
                   type="button"
@@ -1013,7 +1115,7 @@ function App() {
               </tr>
             </thead>
             <tbody>
-              {!jobs.length && <EmptyState filtered={emailFilter.length > 0} />}
+              {!jobs.length && <EmptyState filtered={emailFilter.length > 0 || hasAccountFilters} />}
               {jobs.map((job) => (
                 <React.Fragment key={job.id}>
                   <JobRow
@@ -1034,6 +1136,7 @@ function App() {
                     logoutAllAvailable={Boolean(features.logoutAllDevices)}
                     forceReloginAvailable={Boolean(features.forceRelogin)}
                     accountProxyUrl={accountProxyUrl}
+                    onEditAnnotations={features.accountAnnotations ? () => setAnnotationTargets({ ids: [job.id], email: job.email, initial: job.annotations, bulk: false }) : null}
                   />
                   {expandedJobId === job.id && (
                     <tr className="log-row">
@@ -1447,6 +1550,8 @@ function App() {
         </div>
       )}
       {passwordBatchTargets && <BatchPasswordDialog targets={passwordBatchTargets} onSubmit={setPasswordSelected} onClose={() => setPasswordBatchTargets(null)} />}
+      {annotationTargets && <AccountAnnotationsDialog targets={annotationTargets} groups={accountFacets.groups}
+        onSubmit={saveAnnotations} onClose={() => setAnnotationTargets(null)} />}
       {batchOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
           if (event.target === event.currentTarget && !batchBusy) setBatchOpen(false);
@@ -1476,6 +1581,16 @@ function App() {
               spellCheck="false"
               autoFocus
             />
+            {features.accountAnnotations && <><fieldset className="import-annotations">
+              <legend><Tags size={15} />本批账号标记（可选）</legend>
+              <AccountAnnotationFields value={batchAnnotations} onChange={(key, value) => setBatchAnnotations(current => ({ ...current, [key]: value }))}
+                prefix="import" groups={accountFacets.groups} disabled={batchBusy} />
+              <p className="dialog-hint">应用于本次导入的账号；留空不覆盖已有标记。授权记录未能识别的类型，可按已知账号信息填写。</p>
+            </fieldset>
+            <details className="annotation-import-help"><summary>每行需要不同的标签或备注？</summary>
+              <p>支持每行一个 JSON 对象，行内标记优先于上面的批量标记。已有账号只填写 email 和 annotations 时，仅更新标记。</p>
+              <code>{'{"email":"name@example.com","password":"账号密码","annotations":{"type":"5x","group":"工作号","tags":["新入库"],"note":"到期后续费"}}'}</code>
+            </details></>}
             {batchError && <div className="dialog-error" role="alert"><CircleAlert size={15} />{batchError}</div>}
             <div className="dialog-footer">
               <button type="button" className="cancel-button" onClick={() => setBatchOpen(false)} disabled={batchBusy}>取消</button>
@@ -1522,6 +1637,84 @@ function App() {
       )}
     </main>
   );
+}
+
+function AccountAnnotationFields({ value, onChange, prefix, groups = [], disabled = false, enabled, onToggle }) {
+  const fieldLabel = (key, label) => enabled
+    ? <label className="annotation-field-label"><input type="checkbox" checked={enabled[key]} onChange={event => onToggle(key, event.target.checked)} disabled={disabled} aria-label={`修改${label}`} />{label}</label>
+    : <label className="annotation-field-label" htmlFor={`${prefix}-${key}`}>{label}</label>;
+  const inactive = key => disabled || (enabled && !enabled[key]);
+  return <div className="annotation-fields">
+    <div className="annotation-field">
+      {fieldLabel("type", "账号类型")}
+      <select id={`${prefix}-type`} aria-label="账号类型" value={value.type} onChange={event => onChange("type", event.target.value)} disabled={inactive("type")}>
+        <option value="">自动 / 未标记</option>
+        {ACCOUNT_TYPES.map(type => <option key={type.value} value={type.value}>{type.label}</option>)}
+      </select>
+    </div>
+    <div className="annotation-field">
+      {fieldLabel("group", "本地分组")}
+      <input id={`${prefix}-group`} aria-label="本地分组" list={`${prefix}-groups`} value={value.group} onChange={event => onChange("group", event.target.value)} disabled={inactive("group")} maxLength={60} placeholder="选择已有分组，或输入新分组" />
+      <datalist id={`${prefix}-groups`}>{groups.filter(group => group.value).map(group => <option key={group.value} value={group.value} />)}</datalist>
+    </div>
+    <div className="annotation-field annotation-field-wide">
+      {fieldLabel("tags", "标签")}
+      <input id={`${prefix}-tags`} aria-label="标签" value={value.tags} onChange={event => onChange("tags", event.target.value)} disabled={inactive("tags")} maxLength={500} placeholder="例如：新入库, 待续费, 主力号" />
+      <small>用逗号分隔，最多 12 个标签，每个标签最多 30 个字符。</small>
+    </div>
+    <div className="annotation-field annotation-field-wide">
+      {fieldLabel("note", "备注")}
+      <textarea id={`${prefix}-note`} aria-label="备注" value={value.note} onChange={event => onChange("note", event.target.value)} disabled={inactive("note")} maxLength={1000} rows={3} placeholder="例如：购买批次、用途、到期时间" />
+    </div>
+  </div>;
+}
+
+function AccountAnnotationsDialog({ targets, groups, onSubmit, onClose }) {
+  const dialog = useRef(null);
+  const [value, setValue] = useState(() => ({ ...EMPTY_ANNOTATION_FORM, ...targets.initial, tags: targets.initial?.tags?.join(", ") || "" }));
+  const [enabled, setEnabled] = useState({ type: false, group: false, tags: false, note: false });
+  const [dirty, setDirty] = useState(() => new Set());
+  const [tagsMode, setTagsMode] = useState("append");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    const element = dialog.current;
+    element.showModal();
+    return () => element.close();
+  }, []);
+  const keys = targets.bulk ? Object.keys(enabled).filter(key => enabled[key]) : [...dirty];
+  async function submit(event) {
+    event.preventDefault();
+    if (busy || !keys.length) return;
+    setBusy(true);
+    try {
+      await onSubmit(normalizeAnnotationsPatch(Object.fromEntries(keys.map(key => [key, value[key]]))), targets.bulk ? tagsMode : "replace");
+    } catch (requestError) { setError(requestError.message); }
+    finally { setBusy(false); }
+  }
+  return <dialog ref={dialog} className="batch-dialog annotation-dialog" aria-labelledby="annotation-title"
+    onCancel={event => { if (busy) event.preventDefault(); else onClose(); }}>
+    <form onSubmit={submit}>
+      <div className="dialog-header"><div><h2 id="annotation-title">{targets.bulk ? "批量标记账号" : "账号标记"}</h2></div>
+        <button type="button" className="icon-button" onClick={onClose} disabled={busy} aria-label="关闭账号标记"><X size={18} /></button>
+      </div>
+      <p className="annotation-dialog-description">{targets.bulk ? `已选 ${targets.ids.length} 个账号。勾选需要更新的项目，留空可清空该项。` : targets.email}</p>
+      <AccountAnnotationFields value={value} prefix="edit-annotation" groups={groups} disabled={busy}
+        enabled={targets.bulk ? enabled : undefined} onToggle={(key, checked) => setEnabled(current => ({ ...current, [key]: checked }))}
+        onChange={(key, next) => { setValue(current => ({ ...current, [key]: next })); setDirty(current => new Set([...current, key])); setError(""); }} />
+      {targets.bulk && enabled.tags && <label className="annotation-tag-mode">标签更新方式
+        <select aria-label="标签更新方式" value={tagsMode} onChange={event => setTagsMode(event.target.value)} disabled={busy}>
+          <option value="append">追加到已有标签</option><option value="replace">替换已有标签（留空则清空）</option>
+        </select>
+      </label>}
+      <p className="dialog-hint">手动类型优先显示；选择“自动 / 未标记”后沿用已有授权记录。未识别的类型可手动补充。</p>
+      {error && <div className="dialog-error" role="alert">{error}</div>}
+      <div className="dialog-footer">
+        <button type="button" className="cancel-button" onClick={onClose} disabled={busy}>取消</button>
+        <button type="submit" className="primary-button" disabled={busy || !keys.length}>{busy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}保存标记</button>
+      </div>
+    </form>
+  </dialog>;
 }
 
 function BatchPasswordDialog({ targets, onSubmit, onClose }) {
@@ -1590,7 +1783,7 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, logoutAllAvailable }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, logoutAllAvailable, onEditAnnotations }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const logoutOperationId = useRef(null);
@@ -1784,9 +1977,25 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
       <td>
         <div className="account-cell">
           <div className="account-avatar">{job.email.slice(0, 1).toUpperCase()}</div>
-          <div className="account-details"><strong>{job.email}</strong><span>{shortId(job.id)}</span></div>
+          <div className="account-details"><strong title={job.email}>{job.email}</strong><span>{shortId(job.id)}</span></div>
           <LoginMethodBadge job={job} />
         </div>
+        {onEditAnnotations && <>
+          <div className="account-annotation-row">
+            <span className={`account-type-badge type-${job.accountType || "unknown"}`}
+              title={job.accountTypeSource === "authorization" ? "来自已有授权记录，当前套餐和额度请以官方页面为准" : job.accountTypeSource === "manual" ? "手动标记" : "尚无账号类型标记"}>
+              {ACCOUNT_TYPES.find(type => type.value === job.accountType)?.label || "未标记"}
+              {job.accountTypeSource === "authorization" && <small>记录</small>}
+            </span>
+            <span className="account-group-badge" title={job.annotations?.group || "未分组"}><Folder size={12} />{job.annotations?.group || "未分组"}</span>
+            <button type="button" className="icon-button annotation-edit-button" onClick={onEditAnnotations} aria-label={`编辑 ${job.email} 的标记`} title="编辑类型、分组、标签和备注"><Pencil size={13} /></button>
+          </div>
+          {Boolean(job.annotations?.tags?.length) && <div className="account-tag-list">
+            {job.annotations.tags.slice(0, 3).map(tag => <span key={tag} title={tag}>{tag}</span>)}
+            {job.annotations.tags.length > 3 && <span title={job.annotations.tags.slice(3).join("、")}>+{job.annotations.tags.length - 3}</span>}
+          </div>}
+          {job.annotations?.note && <div className="account-note" title={job.annotations.note}>{job.annotations.note}</div>}
+        </>}
       </td>
       <td><StatusBadge status={job.status} /></td>
       <td className="step-cell">

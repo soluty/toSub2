@@ -276,11 +276,11 @@ th {
   letter-spacing: 0;
 }
 th:nth-child(1) { width: 4%; }
-th:nth-child(2) { width: 17%; }
-th:nth-child(3) { width: 9%; }
-th:nth-child(4) { width: 23%; }
+th:nth-child(2) { width: 22%; }
+th:nth-child(3) { width: 8%; }
+th:nth-child(4) { width: 20%; }
 th:nth-child(5) { width: 8%; }
-th:nth-child(6) { width: 11%; }
+th:nth-child(6) { width: 10%; }
 th:nth-child(7) { width: 28%; }
 .actions-heading { text-align: right; }
 .select-heading, .select-cell { text-align: center; }
@@ -304,7 +304,7 @@ tbody tr:last-child td { border-bottom: 0; }
   font-size: 13px;
   font-weight: 750;
 }
-.account-details { min-width: 0; }
+.account-details { min-width: 0; flex: 1; }
 .account-cell strong { display: block; overflow: hidden; text-overflow: ellipsis; color: var(--ink); font-size: 13px; white-space: nowrap; }
 .account-cell span { display: block; margin-top: 4px; color: #8a9490; font-size: 11px; }
 .account-cell .mail-mode {
@@ -955,4 +955,67 @@ tbody tr:last-child td { border-bottom: 0; }
 
 @media (max-width: 430px) {
   .bulk-actions { grid-template-columns: 1fr; }
+}
+
+.account-organizer { margin-bottom: 14px; background: #fff; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+.account-type-filters { display: flex; flex-wrap: wrap; gap: 5px; padding: 12px; border-bottom: 1px solid #edf0ee; }
+.account-type-filter { display: inline-flex; align-items: center; gap: 8px; min-height: 34px; padding: 5px 11px; border: 1px solid transparent; border-radius: 5px; color: #52625b; background: transparent; font-size: 12px; font-weight: 650; cursor: pointer; }
+.account-type-filter span { min-width: 18px; padding: 1px 5px; border-radius: 4px; color: #7b8781; background: #f0f3f1; font-size: 11px; font-variant-numeric: tabular-nums; }
+.account-type-filter:hover { background: #f2f7f4; }
+.account-type-filter.active { color: var(--green-strong); border-color: #b8d8cb; background: var(--green-soft); }
+.account-type-filter.active span { color: var(--green-strong); background: #d5eade; }
+.account-filter-controls { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; padding: 10px 12px; background: #fcfdfc; }
+.account-filter-controls > label { display: flex; align-items: center; gap: 7px; color: #68786f; font-size: 12px; min-width: 0; }
+.account-filter-controls select { max-width: 230px; min-height: 34px; padding: 5px 28px 5px 8px; border: 1px solid #d5ddd8; border-radius: 5px; background: #fff; color: var(--ink); font: inherit; }
+.account-filter-controls .account-search { flex: 1; min-width: 210px; max-width: 430px; min-height: 34px; padding: 0 10px; border: 1px solid #d5ddd8; border-radius: 5px; background: #fff; }
+.account-search input { width: 100%; min-width: 0; border: 0; background: transparent; outline: 0; font-size: 12px; color: var(--ink); }
+.account-search:focus-within { border-color: var(--green); box-shadow: 0 0 0 2px #12715b15; }
+.account-annotation-row { display: flex; align-items: center; gap: 6px; margin-top: 9px; min-width: 0; }
+.account-type-badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 7px; border: 1px solid #d9e0dc; border-radius: 4px; background: #f2f4f3; color: #697670; font-size: 11px; line-height: 1.3; font-weight: 750; white-space: nowrap; }
+.account-type-badge small { font-size: 9px; font-weight: 450; opacity: .8; }
+.account-type-badge.type-plus { color: #176b4c; border-color: #b9dfcc; background: #e9f6ed; }
+.account-type-badge.type-5x { color: #245f96; border-color: #bed8ec; background: #edf5fc; }
+.account-type-badge.type-team, .account-type-badge.type-team_5x { color: #896317; border-color: #e7d3a6; background: #fcf5e3; }
+.account-type-badge.type-20x { color: #8b3f58; border-color: #e6c3ce; background: #fbecf1; }
+.account-type-badge.type-pro, .account-type-badge.type-enterprise { color: #4b5775; border-color: #cbd3e0; background: #eff2f8; }
+.account-type-badge.type-edu { color: #286f75; border-color: #b7dcdf; background: #ebf7f8; }
+.account-group-badge { display: inline-flex; align-items: center; gap: 4px; min-width: 0; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #6d7972; font-size: 11px; }
+.account-group-badge svg { flex-shrink: 0; }
+.annotation-edit-button { width: 25px; height: 25px; min-width: 25px; margin-left: auto; color: #7c8b82; }
+.account-tag-list { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
+.account-tag-list span { max-width: 110px; padding: 2px 6px; border-radius: 3px; color: #64796a; background: #f0f4f1; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-note { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; margin-top: 6px; overflow: hidden; color: #7c817e; font-size: 11px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
+.annotation-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 13px 16px; }
+.annotation-field { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.annotation-field-wide { grid-column: 1 / -1; }
+.annotation-field-label { display: inline-flex; align-items: center; gap: 7px; color: #4b5a52; font-size: 12px; font-weight: 650; }
+.annotation-field-label input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--green); }
+.annotation-field > input, .annotation-field > select, .annotation-tag-mode select { width: 100%; min-height: 37px; padding: 7px 9px; border: 1px solid #cdd5d1; border-radius: 5px; background: #fbfcfb; color: var(--ink); font: inherit; font-size: 12px; }
+.annotation-fields textarea { min-height: 76px; padding: 8px 10px; font: inherit; font-size: 12px; line-height: 1.6; }
+.annotation-field small { color: var(--muted); font-size: 11px; }
+.annotation-field :disabled { background: #f2f4f3; color: #89938e; opacity: .75; }
+.annotation-field input:focus-visible, .annotation-field select:focus-visible, .account-filter-controls select:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
+.import-annotations { margin: 20px 0 0; padding: 14px; border: 1px solid #dce6df; border-radius: 6px; background: #fcfdfc; }
+.import-annotations legend { padding: 0 6px; color: #37664f; font-size: 12px; font-weight: 650; }
+.import-annotations legend svg { margin-right: 6px; vertical-align: middle; }
+#batch-input { min-height: 180px; }
+.annotation-import-help { margin-top: 12px; color: #66756c; font-size: 12px; line-height: 1.7; }
+.annotation-import-help summary { cursor: pointer; }
+.annotation-import-help code { display: block; padding: 9px; background: #f4f7f5; border-radius: 4px; font-size: 11px; overflow-wrap: anywhere; }
+.annotation-dialog { width: min(570px, calc(100vw - 32px)); color: var(--ink); }
+.annotation-dialog:not([open]) { display: none; }
+.annotation-dialog::backdrop { background: rgba(22, 31, 28, .42); }
+.annotation-dialog-description { margin: 17px 0; color: #67776d; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.annotation-tag-mode { display: flex; align-items: center; gap: 10px; margin-top: 10px; color: #657569; font-size: 12px; }
+.annotation-tag-mode select { width: auto; flex: 1; }
+@media (max-width: 650px) {
+  form[aria-labelledby="batch-title"] .dialog-header > div { flex-direction: column; align-items: flex-start; gap: 4px; }
+  #batch-title { white-space: nowrap; }
+  #batch-input { min-height: 150px; }
+  .account-filter-controls > label { width: 100%; }
+  .account-filter-controls select { flex: 1; max-width: none; }
+  .account-filter-controls .account-search { max-width: none; }
+  .annotation-fields { grid-template-columns: 1fr; }
+  .annotation-field-wide { grid-column: auto; }
+  .account-type-filter { padding: 5px 8px; gap: 5px; }
 }
