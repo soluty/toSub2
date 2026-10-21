@@ -38,10 +38,10 @@ import {
 } from "lucide-react";
 import "./styles.css";
 import { validateAccountPassword } from "../../src/password-policy.mjs";
-import { ACCOUNT_TYPES, normalizeAnnotationsPatch } from "../../src/account-annotations.mjs";
+import { ACCOUNT_TYPES, ACCOUNT_STATUS_LABELS, normalizeAnnotationsPatch } from "../../src/account-annotations.mjs";
 
 const EMPTY_ANNOTATION_FORM = { type: "", group: "", tags: "", note: "" };
-const EMPTY_ACCOUNT_FILTERS = { type: "", group: null, tag: "", search: "" };
+const EMPTY_ACCOUNT_FILTERS = { type: "", status: "", group: null, tag: "", search: "" };
 
 const POLL_INTERVAL_MS = 900;
 const LUBAN_API_KEY_STORAGE_KEY = "chatgpt-onboarding.luban-api-key";
@@ -78,7 +78,7 @@ function App() {
   const [annotationTargets, setAnnotationTargets] = useState(null);
   const [accountFilters, setAccountFilters] = useState({ ...EMPTY_ACCOUNT_FILTERS });
   const [accountSearch, setAccountSearch] = useState("");
-  const [accountFacets, setAccountFacets] = useState({ total: 0, groups: [], tags: [], types: {} });
+  const [accountFacets, setAccountFacets] = useState({ total: 0, groups: [], tags: [], types: {}, statuses: {} });
   const [refreshVersion, setRefreshVersion] = useState(0);
   const [filterOpen, setFilterOpen] = useState(false);
   const [filterText, setFilterText] = useState("");
@@ -125,7 +125,7 @@ function App() {
   });
   const [uploadNotice, setUploadNotice] = useState("");
   const [accountProxyUrl, setAccountProxyUrl] = useState(() => readLocalTextSetting(ACCOUNT_PROXY_STORAGE_KEY));
-  const hasAccountFilters = Boolean(accountFilters.type || accountFilters.group !== null || accountFilters.tag || accountFilters.search);
+  const hasAccountFilters = Boolean(accountFilters.type || accountFilters.status || accountFilters.group !== null || accountFilters.tag || accountFilters.search);
 
   useEffect(() => {
     if (accountSearch.trim() === accountFilters.search) return undefined;
@@ -177,6 +177,7 @@ function App() {
               method: "POST",
               body: JSON.stringify({ page, ...(emailFilter.length ? { emails: emailFilter } : {}), filters: {
                 ...(accountFilters.type ? { type: accountFilters.type } : {}),
+                ...(accountFilters.status ? { status: accountFilters.status } : {}),
                 ...(accountFilters.group !== null ? { group: accountFilters.group } : {}),
                 ...(accountFilters.tag ? { tag: accountFilters.tag } : {}),
                 ...(accountFilters.search ? { search: accountFilters.search } : {}),
@@ -981,6 +982,12 @@ function App() {
               ))}
             </div>
             <div className="account-filter-controls">
+              {features.accountStatusFilter && <label><Filter size={15} /><span>状态</span>
+                <select aria-label="筛选账号状态" value={accountFilters.status} onChange={event => changeAccountFilter("status", event.target.value)}>
+                  <option value="">全部状态</option>
+                  {Object.entries(ACCOUNT_STATUS_LABELS).map(([status, label]) => <option key={status} value={status}>{label}（{accountFacets.statuses?.[status] || 0}）</option>)}
+                </select>
+              </label>}
               <label><Folder size={15} /><span>分组</span>
                 <select aria-label="筛选本地分组" value={accountFilters.group === null ? "all" : JSON.stringify(accountFilters.group)}
                   onChange={event => changeAccountFilter("group", event.target.value === "all" ? null : JSON.parse(event.target.value))}>
@@ -2188,29 +2195,29 @@ function JobLogs({ token, jobId }) {
 }
 
 function StatusBadge({ status }) {
-  const config = {
-    queued: ["排队中", <LoaderCircle size={14} />],
-    starting: ["启动中", <LoaderCircle className="spin" size={14} />],
-    working: ["处理中", <LoaderCircle className="spin" size={14} />],
-    password: ["待密码", <KeyRound size={14} />],
-    mfa_otp: ["待 2FA", <ShieldCheck size={14} />],
-    totp_starting: ["准备 2FA", <LoaderCircle className="spin" size={14} />],
-    password_add_starting: ["准备密码", <LoaderCircle className="spin" size={14} />],
-    password_set_starting: ["设置密码", <LoaderCircle className="spin" size={14} />],
-    logout_starting: ["准备登出", <LoaderCircle className="spin" size={14} />],
-    totp_setup_otp: ["激活 2FA", <ShieldCheck size={14} />],
-    email_otp: ["待邮箱码", <Mail size={14} />],
-    phone: ["待手机号", <Smartphone size={14} />],
-    phone_otp: ["待手机码", <Smartphone size={14} />],
-    finalizing: ["生成中", <LoaderCircle className="spin" size={14} />],
-    refreshing: ["刷新授权", <RefreshCw className="spin" size={14} />],
-    completed: ["已完成", <Check size={14} />],
-    failed: ["失败", <CircleAlert size={14} />],
-    canceled: ["已取消", <Ban size={14} />],
-    reauth_required: ["待重新授权", <RefreshCw size={14} />],
-    resume_available: ["可继续", <RotateCcw size={14} />],
-  }[status] || [status, null];
-  return <span className={`status-badge ${status}`}>{config[1]}{config[0]}</span>;
+  const icon = {
+    queued: <LoaderCircle size={14} />,
+    starting: <LoaderCircle className="spin" size={14} />,
+    working: <LoaderCircle className="spin" size={14} />,
+    password: <KeyRound size={14} />,
+    mfa_otp: <ShieldCheck size={14} />,
+    totp_starting: <LoaderCircle className="spin" size={14} />,
+    password_add_starting: <LoaderCircle className="spin" size={14} />,
+    password_set_starting: <LoaderCircle className="spin" size={14} />,
+    logout_starting: <LoaderCircle className="spin" size={14} />,
+    totp_setup_otp: <ShieldCheck size={14} />,
+    email_otp: <Mail size={14} />,
+    phone: <Smartphone size={14} />,
+    phone_otp: <Smartphone size={14} />,
+    finalizing: <LoaderCircle className="spin" size={14} />,
+    refreshing: <RefreshCw className="spin" size={14} />,
+    completed: <Check size={14} />,
+    failed: <CircleAlert size={14} />,
+    canceled: <Ban size={14} />,
+    reauth_required: <RefreshCw size={14} />,
+    resume_available: <RotateCcw size={14} />,
+  }[status] || null;
+  return <span className={`status-badge ${status}`}>{icon}{ACCOUNT_STATUS_LABELS[status] || status}</span>;
 }
 
 function LoginMethodBadge({ job }) {

@@ -21,10 +21,12 @@ try {
   await fixture("five", "pro", { type: "5x", group: "日常使用", tags: ["代码项目"], note: "前端开发用" });
   await fixture("team", "business", { group: "团队账号", tags: ["协作"], note: "产品组共享工作区" });
   await fixture("team-five", "self_serve_business_prolite", { group: "团队账号" });
+  await fixture("reauth-team", "self_serve_business_prolite", { group: "团队账号", tags: ["待处理"], note: "等待重新授权" }, "output", "reauth_required");
   await fixture("twenty", "pro", { type: "20x", group: "备用账号", tags: ["新入库", "高额度"], note: "10 月采购，待分配" });
   await fixture("unmarked", "", {});
   if (!serving) {
     await fixture("pro", "pro", {});
+    await fixture("failed-team", "business", { group: "团队账号" }, "output", "failed");
     for (let i = 0; i < 25; i++) await fixture(`paged-${i}`, "plus", { group: "跨页测试", tags: ["批次 A"], note: `续费批次 ${i}` });
     await fixture("checkpoint", "", { type: "team", group: "恢复测试", note: "检查点账号" }, "checkpoint");
     await fixture("checkpoint-team-five", "team_5x", {}, "checkpoint");
@@ -52,17 +54,32 @@ try {
     assert.equal((await getJob("team-five")).accountType, "plus");
     assert.equal((await annotate([teamFiveId], { type: "" })).status, 200);
     assert.equal((await getJob("team-five")).accountType, "team_5x");
-    assert.equal((await query({ type: "team_5x" })).pagination.total, 2);
+    assert.equal((await query({ type: "team_5x" })).pagination.total, 3);
     assert.equal((await getJob("pro")).accountType, "pro", "不能把 Pro 推断成 5x 或 20x");
     assert.equal((await getJob("unmarked")).accountType, "unknown");
     assert.equal((await getJob("invalid-metadata")).annotations.note, "保留有效字段");
     assert.equal((await getJob("invalid-metadata")).annotations.group, "");
 
-    const paged = await query({ group: "跨页测试", type: "plus", tag: "批次 A", search: "续费" }, 2);
+    const paged = await query({ group: "跨页测试", type: "plus", status: "completed", tag: "批次 A", search: "续费" }, 2);
     assert.equal(paged.pagination.total, 25);
     assert.equal(paged.jobs.length, 5);
     assert.equal(paged.selection.length, 25, "筛选必须在分页前执行，并支持跨页选择");
     assert(paged.selection.every(job => job.accountType === "plus"));
+    assert(paged.selection.every(job => job.status === "completed"));
+    const pending = await query({ type: "team_5x", status: "reauth_required", group: "团队账号", tag: "待处理", search: "等待重新" });
+    assert.deepEqual(pending.jobs.map(job => job.email), ["reauth-team@example.com"]);
+    assert.deepEqual(pending.selection.map(job => job.id), [fixtures.get("reauth-team").id]);
+    assert.equal(pending.facets.statuses.reauth_required, 1);
+    assert.equal(Object.values(pending.facets.statuses).reduce((sum, count) => sum + count, 0), pending.pagination.totalAll);
+    assert((await query({ status: "completed" })).selection.every(job => job.status === "completed"));
+    assert.deepEqual((await query({ status: "failed" })).jobs.map(job => job.email), ["failed-team@example.com"]);
+    assert((await query({ status: "canceled" })).jobs.length > 0);
+    assert.equal((await query({ type: "plus", status: "reauth_required" })).pagination.total, 0);
+    const emailAndStatus = await (await request("/api/jobs/query", { emails: ["plus@example.com", "reauth-team@example.com"], filters: { status: "reauth_required" } })).json();
+    assert.deepEqual(emailAndStatus.jobs.map(job => job.email), ["reauth-team@example.com"]);
+    for (const status of ["not-a-status", ["completed"], null, ""]) {
+      assert.equal((await request("/api/jobs/query", { filters: { status } })).status, 400);
+    }
     assert.equal((await query({ group: "不存在" })).pagination.total, 0);
     const combined = await (await request("/api/jobs/query", { emails: ["plus@example.com", "five@example.com"], filters: { type: "plus" } })).json();
     assert.deepEqual(combined.jobs.map(job => job.email), ["plus@example.com"]);
@@ -129,6 +146,7 @@ try {
     assert.deepEqual((await getJob("import-team")).annotations.tags, []);
     await until(async () => (await getJob("import-json")).status === "email_otp");
     const activeBefore = await getJob("import-json");
+    assert.deepEqual((await query({ status: "email_otp", search: "import-json@example.com" })).jobs.map(job => job.id), [activeBefore.id]);
     assert.equal((await annotate([activeBefore.id], { note: "执行中也能修改备注" })).status, 200);
     const activeAfter = await getJob("import-json");
     assert.equal(activeAfter.attempt, activeBefore.attempt);
@@ -153,6 +171,7 @@ try {
     assert.equal((await getJob("team-five")).accountType, "team_5x");
     assert.equal((await getJob("team-five")).accountTypeSource, "authorization");
     assert.equal((await getJob("checkpoint-team-five")).accountType, "team_5x");
+    assert.equal((await query({ status: "reauth_required", group: "团队账号" })).pagination.total, 1);
     assert.equal((await getJob("metadata")).annotations.type, "free");
     assert.equal((await getJob("import-json")).annotations.note, "执行中也能修改备注");
     assert.equal((await query({ group: "批量已归档" })).pagination.total, 25);
@@ -167,7 +186,7 @@ try {
   await fs.rm(root, { recursive: true, force: true });
 }
 
-async function fixture(name, plan, annotations, kind = "output") {
+async function fixture(name, plan, annotations, kind = "output", status = kind === "output" ? "completed" : "canceled") {
   const id = crypto.randomUUID(), directory = path.join(root, id), email = `${name}@example.com`;
   await fs.mkdir(directory);
   if (kind === "output") {
@@ -176,7 +195,7 @@ async function fixture(name, plan, annotations, kind = "output") {
   } else if (kind === "checkpoint") {
     await fs.writeFile(path.join(directory, "login-checkpoint.json"), JSON.stringify({ version: 1, email, stage: "email_verified", cookies: [] }));
   }
-  await fs.writeFile(path.join(directory, "job-meta.json"), JSON.stringify({ email, status: kind === "output" ? "completed" : "canceled",
+  await fs.writeFile(path.join(directory, "job-meta.json"), JSON.stringify({ email, status,
     account_annotations: annotations, observed_account_type: kind === "checkpoint" ? plan : "", last_operation_type: "initial_authorization" }));
   fixtures.set(name, { id, directory });
 }

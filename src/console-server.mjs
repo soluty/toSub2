@@ -226,6 +226,7 @@ async function handleApi(req, res, requestUrl) {
         pagination: true,
         uniqueEmail: true,
         accountAnnotations: true,
+        accountStatusFilter: true,
         smsProviders: publicSmsProviderDefinitions(),
         queue: true,
         sourceExport: true,

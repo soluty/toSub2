@@ -10,6 +10,29 @@ export const ACCOUNT_TYPES = [
   { value: "edu", label: "Edu" },
 ];
 const TYPE_VALUES = new Set(ACCOUNT_TYPES.map(type => type.value));
+export const ACCOUNT_STATUS_LABELS = {
+  completed: "已完成",
+  reauth_required: "待重新授权",
+  failed: "失败",
+  resume_available: "可继续",
+  canceled: "已取消",
+  queued: "排队中",
+  starting: "启动中",
+  working: "处理中",
+  refreshing: "刷新授权",
+  finalizing: "生成中",
+  email_otp: "待邮箱码",
+  password: "待密码",
+  mfa_otp: "待 2FA",
+  phone: "待手机号",
+  phone_otp: "待手机码",
+  totp_starting: "准备 2FA",
+  totp_setup_otp: "激活 2FA",
+  password_add_starting: "准备密码",
+  password_set_starting: "设置密码",
+  logout_starting: "准备登出",
+};
+const STATUS_VALUES = new Set(Object.keys(ACCOUNT_STATUS_LABELS));
 export const EMPTY_ANNOTATIONS = Object.freeze({ type: "", group: "", tags: [], note: "" });
 
 function invalid(message) { return Object.assign(new Error(message), { status: 400 }); }
@@ -74,6 +97,10 @@ export function effectiveAccountType(job) {
 export function normalizeAccountFilters(value = {}) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw invalid("账号筛选格式不正确");
   const filters = {};
+  if (Object.hasOwn(value, "status")) {
+    if (!STATUS_VALUES.has(value.status)) throw invalid("筛选状态不正确");
+    filters.status = value.status;
+  }
   if (Object.hasOwn(value, "type")) {
     if (value.type !== "unknown" && !TYPE_VALUES.has(value.type)) throw invalid("筛选类型不正确");
     filters.type = value.type;
@@ -85,6 +112,7 @@ export function normalizeAccountFilters(value = {}) {
 }
 
 export function matchesAccountFilters(job, filters) {
+  if (filters.status && job.status !== filters.status) return false;
   const annotations = restoreAnnotations(job.annotations);
   if (filters.type && effectiveAccountType(job) !== filters.type) return false;
   if (Object.hasOwn(filters, "group") && annotations.group !== filters.group) return false;
@@ -94,8 +122,9 @@ export function matchesAccountFilters(job, filters) {
 }
 
 export function accountFacets(jobs) {
-  const groups = new Map(), tags = new Map(), types = new Map();
+  const groups = new Map(), tags = new Map(), types = new Map(), statuses = new Map();
   for (const job of jobs) {
+    statuses.set(job.status, (statuses.get(job.status) || 0) + 1);
     const annotations = restoreAnnotations(job.annotations);
     groups.set(annotations.group, (groups.get(annotations.group) || 0) + 1);
     for (const tag of annotations.tags) tags.set(tag, (tags.get(tag) || 0) + 1);
@@ -103,7 +132,7 @@ export function accountFacets(jobs) {
     types.set(type, (types.get(type) || 0) + 1);
   }
   const items = values => [...values].sort(([a], [b]) => a.localeCompare(b, "zh-CN")).map(([value, count]) => ({ value, count }));
-  return { total: jobs.length, groups: items(groups), tags: items(tags), types: Object.fromEntries(types) };
+  return { total: jobs.length, groups: items(groups), tags: items(tags), types: Object.fromEntries(types), statuses: Object.fromEntries(statuses) };
 }
 
 // 只读取已有授权记录的套餐标识作为参考，不发起平台请求，也不把 Pro 推断成 5x / 20x。
