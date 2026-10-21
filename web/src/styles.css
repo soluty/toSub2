@@ -614,6 +614,11 @@ tbody tr:last-child td { border-bottom: 0; }
 .batch-dialog textarea:focus { border-color: var(--green); box-shadow: 0 0 0 3px rgba(18, 113, 91, .1); }
 .batch-dialog textarea::placeholder { color: #98a19e; }
 .filter-dialog textarea { min-height: 220px; }
+.security-paused { display: flex; align-items: center; gap: 5px; margin-top: 7px; color: #8b692e; font-size: 11px; }
+.logout-all-button { display: inline-flex; align-items: center; justify-content: center; gap: 7px; min-height: 36px; padding: 0 13px; border: 1px solid #ad443d; border-radius: 5px; background: #ad443d; color: #fff; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; }
+.logout-all-button:hover:not(:disabled) { background: #943b35; }
+.logout-all-button:disabled { opacity: .45; cursor: not-allowed; }
+.logout-all-button:focus-visible { outline: 3px solid #e1aaa5; outline-offset: 2px; }
 .sms-settings-dialog { width: min(620px, 100%); }
 .mail-request-settings-dialog { width: min(620px, 100%); }
 .sub2api-settings-dialog { width: min(620px, 100%); }

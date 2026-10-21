@@ -219,6 +219,7 @@ export class TlsFingerprintTransport {
       const riskControl = isRiskControlResult(result);
       if (
         riskControl
+        && options.allowChallengeReplay !== false
         && this.cloudflareSolver
         && !cloudflareSolveAttempted
         && isSupportedCloudflareChallenge(result)

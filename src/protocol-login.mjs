@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
+import { getLogoutSession, logoutAllDevices, readLogoutResult, writeLogoutResult } from "./account-security.mjs";
 import {
   browserIdentityForTlsProfile,
   shouldUseTlsTransport,
@@ -160,7 +161,7 @@ class ProtocolClient {
   }
 
   async rawFetch(url, options = {}) {
-    if (this.transport) return this.transport.fetch(url, { ...options, retryRiskControl: true });
+    if (this.transport) return this.transport.fetch(url, { retryRiskControl: true, ...options });
     return fetch(url, options);
   }
 
@@ -218,6 +219,8 @@ class ProtocolClient {
         redirect: "manual",
         signal: controller.signal,
         timeoutMs: options.timeoutMs || DEFAULT_TIMEOUT_MS,
+        retryRiskControl: options.retryRiskControl ?? true,
+        allowChallengeReplay: options.allowChallengeReplay ?? true,
       });
       this.jar.setFromResponse(url, res.headers);
       this.jar.merge(res.headers.transportCookies);
@@ -320,6 +323,10 @@ async function run() {
       return;
     }
     await transport.prepareProxy(proxyTemplate, `${chatgptBase}/`);
+    if (args.logoutAllDevices) {
+      await runLogoutAllDevices(args, { chatgptBase, authBase, transport });
+      return;
+    }
     if (args.addPassword) {
       const resultPath = path.resolve(args.passwordAddResult || DEFAULT_PASSWORD_ADD_RESULT);
       const newPassword = validateNewAccountPassword(process.env.CHATGPT_NEW_PASSWORD || "");
@@ -653,6 +660,68 @@ async function run() {
     }
   } finally {
     await transport.close();
+  }
+}
+
+async function runLogoutAllDevices(args, { chatgptBase, authBase, transport }) {
+  const email = String(args.email || "").trim();
+  if (!email) throw new Error("登出所有设备需要指定 --email");
+  const operationId = args.logoutOperationId || crypto.randomUUID();
+  const resultPath = path.resolve(args.logoutResult || "tmp/logout-all-result.json");
+  let result = await readLogoutResult(resultPath, operationId, email);
+  if (result && result.state !== "preparing") {
+    throw new Error("这次登出操作已经发送或结束，不能自动重复执行");
+  }
+  result ||= { version: 1, operationId, email, state: "preparing", startedAt: new Date().toISOString() };
+  await writeLogoutResult(resultPath, result);
+  const saveState = async (state, error = null) => {
+    result = { ...result, state, error, updatedAt: new Date().toISOString() };
+    await writeLogoutResult(resultPath, result);
+    console.log(`[logout-all-${state}] ${state === "accepted" ? "平台已受理登出请求，其他设备可能延迟生效。" : "登出操作状态已保存。"}`);
+  };
+  const rl = readline.createInterface({ input, output });
+  try {
+    let client = null;
+    let web = null;
+    let session = null;
+    if (args.resumeCheckpoint) {
+      let checkpoint;
+      try { checkpoint = await readProtocolCheckpoint(path.resolve(args.resumeCheckpoint)); }
+      catch (error) { if (error.code !== "ENOENT") throw new Error("登录检查点不可读取，请重新登录后再执行登出"); }
+      if (checkpoint) {
+        if (checkpoint.email.toLowerCase() !== email.toLowerCase()) throw new Error("登录检查点与所选账号不一致");
+        client = new ProtocolClient({ verbose: args.verbose, jar: CookieJar.fromJSON(checkpoint.cookies), transport });
+        web = checkpoint.web;
+        try { session = await getLogoutSession(client, { chatgptBase, email }); }
+        catch (error) { if (error.code !== "LOGOUT_LOGIN_REQUIRED") throw error; }
+      }
+    }
+    if (!session) {
+      client = new ProtocolClient({ verbose: args.verbose, transport });
+      console.log("[logout-all] 正在验证账号身份，完成后提交登出所有设备请求。");
+      web = await loginChatgptWeb(client, {
+        chatgptBase, authBase, email, rl,
+        password: process.env.CHATGPT_LOGIN_PASSWORD || "",
+        totpSecret: process.env.CHATGPT_TOTP_SECRET || "",
+      });
+      session = await getLogoutSession(client, { chatgptBase, email });
+    }
+    await logoutAllDevices(client, {
+      chatgptBase, session,
+      deviceId: web?.deviceId || client.jar.value("oai-did", `${chatgptBase}/`) || crypto.randomUUID(),
+      saveState,
+    });
+  } catch (error) {
+    if (result.state === "preparing") await saveState("failed", "身份验证或请求准备未完成，尚未提交登出请求");
+    // 不输出上游返回体，避免会话或凭据进入协议日志。
+    throw new Error(result.state === "preparing" || result.state === "failed"
+      ? "登出操作的身份验证未完成，请检查登录状态后重试"
+      : "登出操作中断，请核实已保存的操作结果");
+  } finally {
+    rl.close();
+    if (["requesting", "accepted", "unknown"].includes(result.state) && args.resumeCheckpoint) {
+      await removeProtocolCheckpoint(path.resolve(args.resumeCheckpoint));
+    }
   }
 }
 
@@ -2221,6 +2290,9 @@ function parseArgs(argv) {
     else if (item === "--web-only") args.webOnly = true;
     else if (item === "--setup-totp") args.setupTotp = true;
     else if (item === "--add-password") args.addPassword = true;
+    else if (item === "--logout-all-devices") args.logoutAllDevices = true;
+    else if (item === "--logout-result") args.logoutResult = argv[++i];
+    else if (item === "--logout-operation-id") args.logoutOperationId = argv[++i];
     else if (item.startsWith("--password-add-result=")) args.passwordAddResult = item.slice("--password-add-result=".length);
     else if (item === "--password-add-result") args.passwordAddResult = argv[++i];
     else if (item.startsWith("--totp-result=")) args.totpResult = item.slice("--totp-result=".length);
@@ -2361,6 +2433,9 @@ Options:
   --email <email>                 Email address. If omitted, prompt manually.
   --phone <phone>                 Phone number in E.164 format. If omitted, prompt when needed.
   --web-only                      Only complete ChatGPT web login, skip Codex OAuth.
+  --logout-all-devices            验证账号身份并登出所有设备，不执行 Codex 授权。
+  --logout-result <file>          保存登出状态，用于处理中断和不确定结果。
+  --logout-operation-id <id>      登出操作唯一编号，防止同一次请求自动重放。
   --setup-totp                    Sign in and set up TOTP 2FA; skip Codex OAuth.
   --totp-result <file>            Private 2FA setup result. Default: ${DEFAULT_TOTP_RESULT}
   --add-password                  Sign in and add a password to a passwordless account.
@@ -2397,7 +2472,7 @@ Notes:
 }
 
 run().catch((error) => {
-  if (isProxyRiskControlError(error)) {
+  if (isProxyRiskControlError(error) && !process.argv.includes("--logout-all-devices")) {
     console.error(`[proxy-risk-retry] ${String(error.message || "Proxy security check").slice(0, 320)}`);
   } else {
     console.error(`[error] ${error.message}`);

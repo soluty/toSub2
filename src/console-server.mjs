@@ -17,6 +17,7 @@ import {
 } from "./mail-otp.mjs";
 import { createSmsProvider, publicSmsProviderDefinitions } from "./sms-providers.mjs";
 import { DirectTlsProfileProbe, proxySupportsSessionRotation } from "./tls-transport.mjs";
+import { LOGOUT_RESULT_FILENAME, readLogoutResult, writeLogoutResult } from "./account-security.mjs";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 4399;
@@ -118,11 +119,13 @@ if (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 655
 await fs.mkdir(OUTPUT_ROOT, { recursive: true });
 await loadSub2ApiMonitorConfiguration();
 await syncCompletedOutputs(true);
+await restoreLogoutOperations();
 scheduleQueuedJobs();
 scheduleSub2ApiMonitor();
 
 const vite = await createViteServer({
   root: WEB_ROOT,
+  cacheDir: path.join(TOOL_ROOT, "tmp", "vite-cache", String(requestedPort)),
   configFile: false,
   appType: "spa",
   plugins: [react()],
@@ -216,6 +219,7 @@ async function handleApi(req, res, requestUrl) {
         totpSetup: true,
         passwordAdd: true,
         forceRelogin: true,
+        logoutAllDevices: true,
       },
     });
     return;
@@ -531,7 +535,7 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
-  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|add-password|logs|download|sms-number|luban-number))?$/.exec(requestUrl.pathname);
+  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|add-password|logout-all|resume-auto-repair|logs|download|sms-number|luban-number))?$/.exec(requestUrl.pathname);
   if (!match) {
     sendJson(res, 404, { error: "Not found" });
     return;
@@ -544,6 +548,25 @@ async function handleApi(req, res, requestUrl) {
   }
 
   const action = match[2];
+  if (req.method === "POST" && action === "logout-all") {
+    const body = await readJson(req);
+    if (body.confirmed !== true) throw httpError(400, "请先确认登出所有设备的影响范围");
+    await withEmailJobLock(job.email, () => startLogoutAll(job, body));
+    sendJson(res, 202, { job: publicJob(job) });
+    return;
+  }
+  if (req.method === "POST" && action === "resume-auto-repair") {
+    const body = await readJson(req);
+    if (body.confirmed !== true) throw httpError(400, "请确认允许号池巡检自动重新登录该账号");
+    await withEmailJobLock(job.email, async () => {
+      if (isActive(job.status) || isLogoutRunning(job)) throw httpError(409, "请先等待当前账号操作结束");
+      job.autoRepairPaused = false;
+      touch(job);
+      await saveJobMetadata(job);
+    });
+    sendJson(res, 200, { job: publicJob(job) });
+    return;
+  }
   if (req.method === "GET" && action === "logs") {
     sendJson(res, 200, { id: job.id, logs: job.logs });
     return;
@@ -754,6 +777,8 @@ function scheduleQueuedJobs() {
     job.queueRunId = queueRunId;
     job.status = mode === "refresh"
       ? "refreshing"
+      : mode === "logout_all"
+        ? "logout_starting"
       : mode === "totp_setup"
         ? "totp_starting"
         : mode === "password_add"
@@ -777,10 +802,16 @@ function scheduleQueuedJobs() {
 
 async function prepareAndLaunchJob(job, mode, queueRunId) {
   try {
-    if (["full", "totp_setup", "password_add"].includes(mode) && job.mailApiUrl) await loadMailboxBaseline(job);
+    if (["full", "totp_setup", "password_add", "logout_all"].includes(mode) && job.mailApiUrl) await loadMailboxBaseline(job);
     if (!isActive(job.status) || job.status === "queued" || job.queueRunId !== queueRunId) return;
     launchJob(job, { mode });
   } catch (error) {
+    if (job.queueRunId !== queueRunId || job.deleted) return;
+    if (mode === "logout_all") {
+      await finishLogoutAll(job, "登出请求准备未完成，请检查登录资料后重试");
+      scheduleQueuedJobs();
+      return;
+    }
     if (mode === "totp_setup") {
       restoreTotpSetupFailure(job, `准备 2FA 设置失败：${error.message}`);
     } else if (mode === "password_add") {
@@ -813,7 +844,11 @@ function launchJob(job, options = {}) {
   job.runId = runId;
   job.runMode = mode;
   job.mailOtpRequestedAt = null;
-  const args = mode === "refresh"
+  const args = mode === "logout_all"
+    ? [PROTOCOL_SCRIPT, "--email", job.email, "--logout-all-devices",
+        "--resume-checkpoint", job.checkpointPath,
+        "--logout-result", logoutResultPath(job), "--logout-operation-id", job.logout.operationId, "--verbose"]
+    : mode === "refresh"
     ? [
         PROTOCOL_SCRIPT,
         "--refresh-sub2api",
@@ -884,7 +919,8 @@ function launchJob(job, options = {}) {
   child.on("error", (error) => {
     void withEmailJobLock(job.email, async () => {
       if (job.runId !== runId) return;
-      if (mode === "totp_setup") restoreTotpSetupFailure(job, `无法启动 2FA 设置进程：${error.message}`);
+      if (mode === "logout_all") await finishLogoutAll(job, "无法启动登出进程");
+      else if (mode === "totp_setup") restoreTotpSetupFailure(job, `无法启动 2FA 设置进程：${error.message}`);
       else if (mode === "password_add") restorePasswordAddFailure(job, `无法启动添加密码进程：${error.message}`);
       else failJob(job, `无法启动登录进程：${error.message}`);
     });
@@ -901,6 +937,11 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
   if (job.runId !== runId) return;
   stopMailPolling(job);
   job.child = null;
+  if (mode === "logout_all") {
+    await finishLogoutAll(job);
+    scheduleQueuedJobs();
+    return;
+  }
   if (mode === "totp_setup") {
     await finishTotpSetup(job, code, signal);
     scheduleQueuedJobs();
@@ -940,9 +981,15 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
 }
 
 function handleChildCloseFailure(job, mode, runId, error) {
-  if (job.runId !== runId && !(["totp_setup", "password_add"].includes(mode) && job.runId === null)) return;
+  if (job.runId !== runId && !(["totp_setup", "password_add", "logout_all"].includes(mode) && job.runId === null)) return;
   const message = `收尾处理失败：${error.message}`;
-  if (mode === "totp_setup") {
+  if (mode === "logout_all") {
+    job.status = "reauth_required";
+    job.prompt = "登出结果已保留，本地清理需要重试";
+    job.lastError = "请重启服务以恢复登出结果并完成清理；自动重登保持暂停";
+    job.runMode = null;
+    job.runId = null;
+  } else if (mode === "totp_setup") {
     job.status = "completed";
     job.prompt = "原授权文件仍然可用，2FA 密钥尚未完成安全保存";
     job.totpSetupError = `${message}；已保留 2FA 结果文件，请重试保存`;
@@ -959,6 +1006,7 @@ function handleChildCloseFailure(job, mode, runId, error) {
 }
 
 async function retryJob(job, options = {}) {
+  if (isLogoutRunning(job)) throw httpError(409, "登出操作尚未结束，暂不能重新授权");
   if (!["failed", "canceled", "reauth_required", "resume_available"].includes(job.status)) {
     throw httpError(409, "当前任务不需要重新授权");
   }
@@ -1009,6 +1057,7 @@ async function retryJob(job, options = {}) {
 }
 
 async function regenerateJob(job, options = {}) {
+  if (isLogoutRunning(job)) throw httpError(409, "登出操作尚未结束，暂不能刷新授权");
   if (job.status !== "completed" || !job.resultSaved) {
     throw httpError(409, "只能为已经完成的任务重新生成授权");
   }
@@ -1111,6 +1160,107 @@ async function reloadMissingJobCredentials(job) {
   if (job.totpSecret) job.hasTotpCredential = true;
   if (stored.password || stored.totpSecret || stored.proxyUrl) {
     await saveStoredLoginCredentials(job.email, job);
+  }
+}
+
+function logoutResultPath(job) {
+  return path.join(path.dirname(job.outputPath), LOGOUT_RESULT_FILENAME);
+}
+
+function isLogoutRunning(job) {
+  return Boolean(job.logout && ["preparing", "requesting"].includes(job.logout.state));
+}
+
+function canLogoutAll(job) {
+  return !shuttingDown && !isLogoutRunning(job)
+    && !["totp_setup", "password_add"].includes(job.runMode)
+    && !(job.status === "queued" && ["totp_setup", "password_add"].includes(job.queuedMode));
+}
+
+async function startLogoutAll(job, options) {
+  const operationId = String(options.operationId || "").toLowerCase();
+  if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(operationId)) throw httpError(400, "缺少有效的登出操作编号");
+  if (job.logout?.operationId === operationId || job.logoutOperationIds?.includes(operationId)) return;
+  if (!canLogoutAll(job)) throw httpError(409, "正在执行账号安全操作，请等待结束后再登出");
+  await reloadMissingJobCredentials(job);
+  if (Object.hasOwn(options, "proxyUrl")) {
+    job.proxyUrl = normalizeProxyUrl(options.proxyUrl);
+    await saveStoredLoginCredentials(job.email, job);
+  }
+  const child = job.child;
+  stopMailPolling(job);
+  releaseSmsNumber(job, "idle");
+  job.queueRunId = null;
+  job.runId = crypto.randomUUID();
+  job.child = null;
+  job.autoRepairPaused = true;
+  job.autoRepairOperation = null;
+  job.autoRepairPendingAccountIds = [];
+  job.autoRepairPendingBackend = null;
+  job.logout = {
+    version: 1, operationId, email: job.email,
+    state: "preparing", startedAt: new Date().toISOString(), error: null,
+  };
+  job.logoutOperationIds = [...new Set([...(job.logoutOperationIds || []), operationId])];
+  job.runMode = "logout_all";
+  job.queuedMode = "logout_all";
+  job.status = "logout_starting";
+  job.prompt = "正在停止原登录任务并准备登出";
+  job.lastError = null;
+  recordJobOperation(job, "logout_all");
+  const exited = waitForChildExit(child, 3_000);
+  child?.kill("SIGTERM");
+  await saveJobMetadata(job);
+  await exited;
+  await writeLogoutResult(logoutResultPath(job), job.logout);
+  job.parserTail = "";
+  job.currentPhone = null;
+  job.phoneError = null;
+  job.securityCheckRequired = false;
+  appendJobLog(job, "[logout-all] 原登录任务已停止，自动重登已暂停。正在验证账号并准备登出所有设备。\n");
+  enqueueJob(job, "logout_all", "正在验证账号身份，准备登出所有设备");
+  await saveJobMetadata(job);
+}
+
+async function finishLogoutAll(job, interruptedMessage = null) {
+  const stored = await readLogoutResult(logoutResultPath(job), job.logout.operationId, job.email);
+  let result = stored || { ...job.logout, state: "unknown", error: "登出操作记录不可用，结果待核实；系统不会自动重新提交" };
+  if (result.state === "requesting") {
+    result = { ...result, state: "unknown", error: "请求发送后流程中断，结果待核实；系统不会自动重新提交" };
+  } else if (result.state === "preparing") {
+    result = { ...result, state: "failed", error: interruptedMessage || "身份验证尚未完成，未确认提交登出请求" };
+  }
+  job.logout = { ...result, updatedAt: result.updatedAt || new Date().toISOString() };
+  job.autoRepairPaused = true;
+  job.queueRunId = null;
+  job.queuedMode = null;
+  job.queuedAt = null;
+  job.runMode = null;
+  job.runId = null;
+  job.child = null;
+  stopMailPolling(job);
+  if (["accepted", "unknown"].includes(result.state)) {
+    await removePrivateFile(job.checkpointPath);
+    job.loginCheckpointAvailable = false;
+  }
+  job.status = "reauth_required";
+  job.prompt = result.state === "accepted"
+    ? "登出请求已受理，其他设备可能延迟生效"
+    : result.state === "unknown" ? "登出结果待核实，自动重登已暂停" : "登出未完成，自动重登已暂停";
+  job.lastError = result.error || null;
+  appendJobLog(job, `[logout-all] ${job.prompt}。\n`);
+  await writeLogoutResult(logoutResultPath(job), job.logout);
+  touch(job);
+  await saveJobMetadata(job);
+}
+
+async function restoreLogoutOperations() {
+  for (const job of jobs.values()) {
+    if (!job.logout) continue;
+    // 仅恢复尚未收尾的登出；后续手动登录产生的检查点不能被旧操作删除。
+    if (isLogoutRunning(job) || (job.lastOperationType === "logout_all" && job.autoRepairPaused)) {
+      await finishLogoutAll(job, "服务重启中断了身份验证，请手动重新发起登出");
+    }
   }
 }
 
@@ -1442,6 +1592,10 @@ function consumeOutput(job, rawText) {
   job.logs = `${job.logs}${text}`.slice(-MAX_LOG_CHARS);
   const scan = `${job.parserTail}${text}`;
   job.parserTail = scan.slice(-2_000);
+  if (job.runMode === "logout_all" && scan.includes("[logout-all-requesting]")) {
+    job.logout.state = "requesting";
+    void saveJobMetadata(job).catch(() => {});
+  }
 
   if (scan.includes("[3/5] Password login page reached.")) {
     markAuthorizationRequirement(job, "password");
@@ -1460,6 +1614,7 @@ function consumeOutput(job, rawText) {
   }
 
   if (scan.includes("[proxy-risk-retry]")) {
+    if (job.runMode === "logout_all") return;
     void restartAfterProxyRisk(job, {
       connectionFailure: scan.includes("PROXY_CONNECTION_RETRY"),
     }).catch((error) => {
@@ -2226,7 +2381,18 @@ async function submitJobInput(job, body, options = {}) {
 }
 
 async function cancelJob(job) {
-  if (!isActive(job.status)) return;
+  if (!isActive(job.status) && !isLogoutRunning(job)) return;
+  if (isLogoutRunning(job)) {
+    const child = job.child;
+    job.queueRunId = null;
+    job.runId = crypto.randomUUID();
+    const exited = waitForChildExit(child, 3_000);
+    child?.kill("SIGTERM");
+    await exited;
+    await finishLogoutAll(job, "已取消登出前的身份验证，自动重登保持暂停");
+    scheduleQueuedJobs();
+    return;
+  }
   if (job.runMode === "totp_setup" || job.queuedMode === "totp_setup") {
     stopMailPolling(job);
     job.runId = crypto.randomUUID();
@@ -2271,7 +2437,7 @@ async function cancelJob(job) {
 }
 
 async function cancelAllJobs() {
-  const activeJobs = [...jobs.values()].filter((job) => isActive(job.status));
+  const activeJobs = [...jobs.values()].filter((job) => isActive(job.status) || isLogoutRunning(job));
   if (!activeJobs.length) return 0;
   queueSchedulingPaused = true;
   try {
@@ -2699,6 +2865,7 @@ async function retryPendingSub2ApiUploads(config, summary) {
         || !job.resultSaved
         || job.status !== "completed"
         || job.autoRepairOperation
+        || job.autoRepairPaused
         || isAutoRepairCoolingDown(job)
       ) return;
 
@@ -2806,6 +2973,7 @@ function isAutoRepairCoolingDown(job) {
 }
 
 function getAutoRepairEligibility(job) {
+  if (job.autoRepairPaused) return { eligible: false, reason: "登出操作已暂停自动重登，需要手动恢复" };
   if (job.autoRepairBlocked) return { eligible: false, reason: "账号已确认封禁、删除或永久停用" };
   if (!job.lastAuthAutomated) return { eligible: false, reason: job.lastAuthAutomationReason || "上次授权不是全自动完成" };
   const requirements = job.lastAuthRequirements || {};
@@ -2991,7 +3159,7 @@ function publicJob(job) {
     smsStatus: job.smsStatus,
     smsError: job.smsError,
     securityCheckRequired: Boolean(job.securityCheckRequired),
-    canRetry: ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
+    canRetry: !isLogoutRunning(job) && ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
     canResume: job.status === "resume_available",
     canRegenerate: job.status === "completed" && job.resultSaved,
     canForceRelogin: canForceRelogin(job),
@@ -3002,6 +3170,9 @@ function publicJob(job) {
     autoRepairEligible: autoRepair.eligible,
     autoRepairEligibilityReason: autoRepair.reason,
     autoRepairBlocked: Boolean(job.autoRepairBlocked),
+    autoRepairPaused: Boolean(job.autoRepairPaused),
+    logout: job.logout ? { state: job.logout.state, startedAt: job.logout.startedAt, updatedAt: job.logout.updatedAt, error: job.logout.error } : null,
+    canLogoutAllDevices: canLogoutAll(job),
     autoRepairBlockedReason: job.autoRepairBlockedReason || null,
     autoRepairLastAttemptAt: job.autoRepairLastAttemptAt || null,
     autoRepairLastSuccessAt: job.autoRepairLastSuccessAt || null,
@@ -3017,7 +3188,7 @@ function publicSelectionJob(job) {
     email: job.email,
     status: job.status,
     canDownload: Boolean(job.resultSaved),
-    canRetry: ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
+    canRetry: !isLogoutRunning(job) && ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
     canRegenerate: job.status === "completed" && job.resultSaved,
     canForceRelogin: canForceRelogin(job),
     canSetupTotp: canSetupTotp(job),
@@ -3026,10 +3197,12 @@ function publicSelectionJob(job) {
 }
 
 function canForceRelogin(job) {
+  if (isLogoutRunning(job)) return false;
   return ["completed", "failed", "canceled", "reauth_required", "resume_available"].includes(job.status);
 }
 
 function canSetupTotp(job) {
+  if (isLogoutRunning(job)) return false;
   if (job.totpSecret || job.hasTotpCredential || job.totpKnownEnabled) return false;
   if (job.status === "completed" && job.resultSaved) return true;
   return Boolean(job.loginCheckpointAvailable)
@@ -3037,6 +3210,7 @@ function canSetupTotp(job) {
 }
 
 function canAddPassword(job) {
+  if (isLogoutRunning(job)) return false;
   if (job.password || job.hasPasswordCredential) return false;
   if (job.status === "completed" && job.resultSaved) return true;
   return Boolean(job.loginCheckpointAvailable)
@@ -3227,18 +3401,25 @@ function resolveSelectedJobs(ids) {
 
 async function deleteJobsByEmail(email) {
   const matching = [...jobs.values()].filter((job) => job.email.toLowerCase() === email);
+  if (matching.some(isLogoutRunning)) throw httpError(409, "登出操作尚未结束，请先等待结果或取消操作");
   const directories = new Set();
+  const childWaits = [];
   matching.forEach((job) => {
     job.deleted = true;
     stopMailPolling(job);
     releaseSmsNumber(job, "idle");
+    job.queueRunId = null;
     job.runId = crypto.randomUUID();
+    if (job.child) childWaits.push(waitForChildExit(job.child, 3_000));
     job.child?.kill("SIGTERM");
     job.child = null;
     directories.add(path.dirname(job.outputPath));
     jobs.delete(job.id);
   });
-  await Promise.allSettled(matching.map((job) => job.metadataWritePromise).filter(Boolean));
+  await Promise.allSettled([
+    ...childWaits,
+    ...matching.map((job) => job.metadataWritePromise).filter(Boolean),
+  ]);
   await Promise.all([
     ...[...directories].map((directory) => fs.rm(directory, { recursive: true, force: true })),
     deleteStoredLoginCredentials(email),
@@ -3453,7 +3634,8 @@ async function syncCompletedOutputs(force = false) {
         const missingStoredCredentials = restoredMissingCredentials(metadata, storedCredentials);
         const storedCredentialsMissing = missingStoredCredentials.length > 0;
         const savedStatus = String(metadata.status || "");
-        const restartable = ["queued", "starting"].includes(savedStatus);
+        const restartable = ["queued", "starting"].includes(savedStatus)
+          && !metadata.auto_repair_paused && metadata.queued_mode !== "logout_all";
         const interrupted = Boolean(savedStatus) && !isTerminalStatus(savedStatus) && !restartable;
         const restoredStatus = storedCredentialsMissing && restartable
           ? "reauth_required"
@@ -3804,6 +3986,11 @@ function restoredAutoRepairState(metadata = {}) {
         }
       : null,
     authAutomationAttempt: null,
+    autoRepairPaused: metadata.auto_repair_paused === true,
+    logout: metadata.logout_operation && /^[a-f0-9-]{36}$/i.test(String(metadata.logout_operation.operationId || ""))
+      ? metadata.logout_operation : null,
+    logoutOperationIds: Array.isArray(metadata.logout_operation_ids)
+      ? metadata.logout_operation_ids.filter(id => typeof id === "string" && /^[a-f0-9-]{36}$/.test(id)) : [],
     autoRepairBlocked: metadata.auto_repair_blocked === true,
     autoRepairBlockedReason: metadata.auto_repair_blocked_reason || null,
     autoRepairBlockedAt: metadata.auto_repair_blocked_at || null,
@@ -4237,6 +4424,7 @@ function escapeRegExp(value) {
 }
 
 async function updateJobCredentials(job, credentials, options = {}) {
+  if (isLogoutRunning(job)) throw httpError(409, "登出操作进行中，暂不能更新账号资料");
   if (credentials.preserveExistingCredentials) await reloadMissingJobCredentials(job);
   const normalized = credentials.preserveExistingCredentials
     ? normalizeLoginCredentials({
@@ -4279,6 +4467,7 @@ async function updateJobCredentials(job, credentials, options = {}) {
 }
 
 async function updateJobProxy(job, proxyUrl) {
+  if (isLogoutRunning(job)) throw httpError(409, "登出操作进行中，暂不能更新代理配置");
   if (job.proxyUrl === proxyUrl) return;
   job.proxyUrl = proxyUrl;
   await saveStoredLoginCredentials(job.email, job);
@@ -4357,6 +4546,9 @@ async function saveJobMetadata(job) {
         last_auth_automated_at: job.lastAuthAutomatedAt || null,
         last_auth_requirements: job.lastAuthRequirements || null,
         auto_repair_blocked: Boolean(job.autoRepairBlocked),
+        auto_repair_paused: Boolean(job.autoRepairPaused),
+        logout_operation: job.logout || null,
+        logout_operation_ids: job.logoutOperationIds || [],
         auto_repair_blocked_reason: job.autoRepairBlockedReason || null,
         auto_repair_blocked_at: job.autoRepairBlockedAt || null,
         auto_repair_last_attempt_at: job.autoRepairLastAttemptAt || null,
@@ -4624,7 +4816,7 @@ async function shutdown() {
       ...sub2ApiRequestPromises,
       ...sub2ApiAutoRepairPromises,
     ].filter(Boolean));
-    const activeJobs = [...jobs.values()].filter((job) => isActive(job.status));
+    const activeJobs = [...jobs.values()].filter((job) => isActive(job.status) || isLogoutRunning(job));
     const childWaits = activeJobs
       .map((job) => job.child)
       .filter(Boolean)
@@ -4642,7 +4834,7 @@ async function shutdown() {
 
 function waitForChildExit(child, timeoutMs) {
   if (!child || child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let timer;
     const finish = () => {
       clearTimeout(timer);
@@ -4651,7 +4843,10 @@ function waitForChildExit(child, timeoutMs) {
     child.once("close", finish);
     timer = setTimeout(() => {
       child.kill("SIGKILL");
-      finish();
+      timer = setTimeout(() => {
+        child.removeListener("close", finish);
+        reject(new Error("登录子进程未能及时退出，已停止后续账号操作"));
+      }, 1_000);
     }, timeoutMs);
   });
 }

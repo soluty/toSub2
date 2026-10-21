@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Ban,
@@ -18,6 +18,7 @@ import {
   ListPlus,
   LoaderCircle,
   LogIn,
+  LogOut,
   Mail,
   MailCheck,
   Plus,
@@ -975,6 +976,7 @@ function App() {
                     sub2apiUploadAvailable={Boolean(features.sub2apiUpload && sub2apiSettings.baseUrl && sub2apiSettings.adminApiKey)}
                     totpSetupAvailable={Boolean(features.totpSetup)}
                     passwordAddAvailable={Boolean(features.passwordAdd)}
+                    logoutAllAvailable={Boolean(features.logoutAllDevices)}
                     forceReloginAvailable={Boolean(features.forceRelogin)}
                     accountProxyUrl={accountProxyUrl}
                   />
@@ -1480,9 +1482,10 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, logoutAllAvailable }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const logoutOperationId = useRef(null);
 
   useEffect(() => setValue(""), [job.status]);
 
@@ -1589,6 +1592,25 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
     }
   }
 
+  async function logoutAllDevices() {
+    if (submitting || !job.canLogoutAllDevices) return;
+    if (!window.confirm(`确定将 ${job.email} 登出所有设备吗？\n这将停止当前登录任务并暂停自动重登。`)) return;
+    setSubmitting(true);
+    try {
+      logoutOperationId.current ||= crypto.randomUUID();
+      await apiFetch(token, `/api/jobs/${job.id}/logout-all`, {
+        method: "POST",
+        body: JSON.stringify({ confirmed: true, operationId: logoutOperationId.current, proxyUrl: accountProxyUrl.trim() }),
+      });
+      logoutOperationId.current = null;
+      onError("");
+    } catch (requestError) {
+      onError(requestError.message);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
   async function copyTotpSecret() {
     try {
       await navigator.clipboard.writeText(job.totpSetupSecret || "");
@@ -1656,6 +1678,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
         )}
         {job.totpSetupError && <div className="row-error">2FA：{extractResponseMessage(job.totpSetupError)}</div>}
         {job.passwordAddError && <div className="row-error">添加密码：{extractResponseMessage(job.passwordAddError)}</div>}
+        {job.autoRepairPaused && <div className="security-paused"><ShieldCheck size={13} />自动重登已暂停</div>}
         {job.mailApiError && job.status === "email_otp" && <div className="mail-error">{job.mailApiError}</div>}
         {job.currentPhone && ["working", "phone", "phone_otp"].includes(job.status) && (
           <div className="phone-target"><Smartphone size={13} />当前手机号：<strong>{job.currentPhone}</strong></div>
@@ -1769,6 +1792,11 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
               {submitting ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}
             </button>
           )}
+          {logoutAllAvailable && (
+            <button type="button" className="logout-all-button" onClick={logoutAllDevices} disabled={submitting || !job.canLogoutAllDevices}>
+              <LogOut size={16} />登出所有设备
+            </button>
+          )}
           {passwordAddAvailable && job.canAddPassword && (
             <button type="button" className="icon-button" onClick={addPassword} disabled={submitting} title="添加密码">
               {submitting ? <LoaderCircle className="spin" size={16} /> : <KeyRound size={16} />}
@@ -1833,6 +1861,7 @@ function StatusBadge({ status }) {
     mfa_otp: ["待 2FA", <ShieldCheck size={14} />],
     totp_starting: ["准备 2FA", <LoaderCircle className="spin" size={14} />],
     password_add_starting: ["准备密码", <LoaderCircle className="spin" size={14} />],
+    logout_starting: ["准备登出", <LoaderCircle className="spin" size={14} />],
     totp_setup_otp: ["激活 2FA", <ShieldCheck size={14} />],
     email_otp: ["待邮箱码", <Mail size={14} />],
     phone: ["待手机号", <Smartphone size={14} />],
@@ -2014,6 +2043,7 @@ function operationLabel(type) {
     resume: "继续中断流程",
     setup_2fa: "设置 2FA",
     add_password: "添加密码",
+    logout_all: "登出所有设备",
     account_update: "更新账号资料",
     proxy_update: "更新代理 IP",
   })[type] || "账号操作";
