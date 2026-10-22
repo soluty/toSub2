@@ -76,6 +76,7 @@ function App() {
   const [batchError, setBatchError] = useState("");
   const [batchAnnotations, setBatchAnnotations] = useState({ ...EMPTY_ANNOTATION_FORM });
   const [annotationTargets, setAnnotationTargets] = useState(null);
+  const [emailChangeTarget, setEmailChangeTarget] = useState(null);
   const [accountFilters, setAccountFilters] = useState({ ...EMPTY_ACCOUNT_FILTERS });
   const [accountSearch, setAccountSearch] = useState("");
   const [accountFacets, setAccountFacets] = useState({ total: 0, groups: [], tags: [], types: {}, statuses: {} });
@@ -1144,6 +1145,7 @@ function App() {
                     forceReloginAvailable={Boolean(features.forceRelogin)}
                     accountProxyUrl={accountProxyUrl}
                     onEditAnnotations={features.accountAnnotations ? () => setAnnotationTargets({ ids: [job.id], email: job.email, initial: job.annotations, bulk: false }) : null}
+                    onChangeEmail={features.emailChange ? () => setEmailChangeTarget(job) : null}
                   />
                   {expandedJobId === job.id && (
                     <tr className="log-row">
@@ -1559,6 +1561,9 @@ function App() {
       {passwordBatchTargets && <BatchPasswordDialog targets={passwordBatchTargets} onSubmit={setPasswordSelected} onClose={() => setPasswordBatchTargets(null)} />}
       {annotationTargets && <AccountAnnotationsDialog targets={annotationTargets} groups={accountFacets.groups}
         onSubmit={saveAnnotations} onClose={() => setAnnotationTargets(null)} />}
+      {emailChangeTarget && <EmailChangeDialog job={emailChangeTarget} token={token}
+        syncAvailable={sub2apiMonitorStatus.configured} onClose={() => setEmailChangeTarget(null)}
+        onStarted={() => { setEmailChangeTarget(null); setRefreshVersion(current => current + 1); }} />}
       {batchOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => {
           if (event.target === event.currentTarget && !batchBusy) setBatchOpen(false);
@@ -1724,6 +1729,73 @@ function AccountAnnotationsDialog({ targets, groups, onSubmit, onClose }) {
   </dialog>;
 }
 
+function EmailChangeDialog({ job, token, syncAvailable, onClose, onStarted }) {
+  const dialog = useRef(null);
+  const [newEmail, setNewEmail] = useState("");
+  const [mailApiUrl, setMailApiUrl] = useState("");
+  const [syncSub2api, setSyncSub2api] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    const element = dialog.current;
+    element.showModal();
+    return () => element.close();
+  }, []);
+  async function submit(event) {
+    event.preventDefault();
+    if (busy) return;
+    if (newEmail.trim().toLowerCase() === job.email.toLowerCase()) {
+      setError("新邮箱不能与原邮箱相同");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await apiFetch(token, `/api/jobs/${job.id}/change-email`, { method: "POST",
+        body: JSON.stringify({ newEmail: newEmail.trim(), mailApiUrl: mailApiUrl.trim(), syncSub2api, confirmed: true }) });
+      onStarted();
+    } catch (requestError) { setError(requestError.message); }
+    finally { setBusy(false); }
+  }
+  return <dialog ref={dialog} className="batch-dialog annotation-dialog email-change-dialog" aria-labelledby="email-change-title"
+    onCancel={event => { if (busy) event.preventDefault(); else onClose(); }}>
+    <form onSubmit={submit}>
+      <div className="dialog-header"><div><h2 id="email-change-title">换绑邮箱</h2></div>
+        <button type="button" className="icon-button" onClick={onClose} disabled={busy} aria-label="关闭换绑邮箱"><X size={18} /></button>
+      </div>
+      <p className="annotation-dialog-description">原邮箱：<strong>{job.email}</strong></p>
+      <div className="email-change-eligibility">
+        <ShieldCheck size={17} />
+        <div><strong>资格待检查</strong><p>Plus、Team、5x、20x 是套餐或本地类型标记，不能据此判断是否支持换绑。验证原账号后会先检查平台资格；不允许或无法确认时立即停止，不发送新邮箱验证码。</p></div>
+      </div>
+      <div className="annotation-fields">
+        <div className="annotation-field annotation-field-wide">
+          <label className="annotation-field-label" htmlFor="email-change-address">新邮箱</label>
+          <input id="email-change-address" type="email" autoComplete="off" required maxLength={254} autoFocus
+            value={newEmail} onChange={event => setNewEmail(event.target.value)} disabled={busy} placeholder="你可以接收验证码的新邮箱" />
+        </div>
+        <div className="annotation-field annotation-field-wide">
+          <label className="annotation-field-label" htmlFor="email-change-mail-api">新邮箱收码地址（可选）</label>
+          <input id="email-change-mail-api" type="url" autoComplete="off" value={mailApiUrl}
+            onChange={event => setMailApiUrl(event.target.value)} disabled={busy} placeholder="https://mail.example/messages/…" />
+          <small>仅支持 GET 收码地址。留空时，在账号列表中手动输入新邮箱验证码。</small>
+        </div>
+      </div>
+      <label className="email-change-sync"><input type="checkbox" checked={syncSub2api}
+        onChange={event => setSyncSub2api(event.target.checked)} disabled={busy || !syncAvailable} />同步更新已关联的 Sub2API 账号</label>
+      {!syncAvailable && <p className="dialog-hint">配置 Sub2API 后可选同步已有账号。</p>}
+      <p className="dialog-hint">确认后将验证原账号、新邮箱及账号身份，成功后保存新邮箱并重新授权。原密码、2FA、分组、标签和备注会保留；登录时仍可能需要原邮箱或 2FA 验证码。</p>
+      {error && <div className="dialog-error" role="alert">{error}</div>}
+      <div className="dialog-footer">
+        <button type="button" className="cancel-button" onClick={onClose} disabled={busy}>取消</button>
+        <button type="submit" className="primary-button" disabled={busy || !newEmail.trim()}>
+          {busy ? <LoaderCircle className="spin" size={16} /> : <MailCheck size={16} />}检查资格并开始换绑
+        </button>
+      </div>
+    </form>
+  </dialog>;
+}
+
 function BatchPasswordDialog({ targets, onSubmit, onClose }) {
   const dialog = useRef(null);
   const [password, setPassword] = useState("");
@@ -1790,12 +1862,21 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, logoutAllAvailable, onEditAnnotations }) {
+function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, logoutAllAvailable, onEditAnnotations, onChangeEmail }) {
   const [value, setValue] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const logoutOperationId = useRef(null);
 
   useEffect(() => setValue(""), [job.status]);
+
+  async function continueEmailChange(action) {
+    setSubmitting(true);
+    try {
+      await apiFetch(token, `/api/jobs/${job.id}/${action}`, { method: "POST" });
+      onError("");
+    } catch (requestError) { onError(requestError.message); }
+    finally { setSubmitting(false); }
+  }
 
   async function sendInput(action, submittedValue = value) {
     setSubmitting(true);
@@ -2015,8 +2096,11 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
         {job.totpRotationError && <div className="row-error">更换 2FA：{extractResponseMessage(job.totpRotationError)}</div>}
         {job.passwordAddError && <div className="row-error">添加密码：{extractResponseMessage(job.passwordAddError)}</div>}
         {job.passwordSetError && <div className="row-error">统一密码：{extractResponseMessage(job.passwordSetError)}</div>}
+        {job.emailChange && !["completed", "failed"].includes(job.emailChange.state) &&
+          <div className="email-change-target">换绑目标：{job.emailChange.newEmail}</div>}
+        {job.emailChange?.error && <div className="row-error">换绑邮箱：{extractResponseMessage(job.emailChange.error)}</div>}
         {job.autoRepairPaused && <div className="security-paused"><ShieldCheck size={13} />自动重登已暂停</div>}
-        {job.mailApiError && job.status === "email_otp" && <div className="mail-error">{job.mailApiError}</div>}
+        {job.mailApiError && ["email_otp", "email_change_otp"].includes(job.status) && <div className="mail-error">{job.mailApiError}</div>}
         {job.currentPhone && ["working", "phone", "phone_otp"].includes(job.status) && (
           <div className="phone-target"><Smartphone size={13} />当前手机号：<strong>{job.currentPhone}</strong></div>
         )}
@@ -2102,6 +2186,18 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
       </td>
       <td>
         <div className="row-actions">
+          {onChangeEmail && <button type="button" className="secondary-button" onClick={onChangeEmail}
+            disabled={submitting || !job.canChangeEmail} title={job.canChangeEmail ? "验证原账号后先检查平台换绑资格" : "请先结束当前任务或处理未完成的换绑"}>
+            <Mail size={16} />换绑邮箱
+          </button>}
+          {job.canVerifyEmailChange && <button type="button" className="secondary-button" disabled={submitting}
+            onClick={() => continueEmailChange("verify-email-change")} title="通过新邮箱核实同一账号，不重复提交换绑">
+            <ShieldCheck size={16} />核实换绑
+          </button>}
+          {job.canFinishEmailChange && <button type="button" className="secondary-button" disabled={submitting}
+            onClick={() => continueEmailChange("finish-email-change")}>
+            <RefreshCw size={16} />{job.emailChange?.state === "sync_pending" ? "重试同步" : "继续保存"}
+          </button>}
           {job.canDownload && (
             <button type="button" className="download-button" onClick={download}>
               <Download size={16} />下载
@@ -2205,6 +2301,8 @@ function StatusBadge({ status }) {
     password_add_starting: <LoaderCircle className="spin" size={14} />,
     password_set_starting: <LoaderCircle className="spin" size={14} />,
     logout_starting: <LoaderCircle className="spin" size={14} />,
+    email_change_starting: <LoaderCircle className="spin" size={14} />,
+    email_change_otp: <MailCheck size={14} />,
     totp_setup_otp: <ShieldCheck size={14} />,
     email_otp: <Mail size={14} />,
     phone: <Smartphone size={14} />,
@@ -2270,6 +2368,9 @@ function getInputConfig(status, currentPhone) {
   }
   if (status === "email_otp") {
     return { action: "email_otp", placeholder: "6 位邮箱验证码", submitLabel: "提交邮箱验证码", inputMode: "numeric", icon: <Mail size={15} /> };
+  }
+  if (status === "email_change_otp") {
+    return { action: "new_email_otp", placeholder: "新邮箱的 6 位验证码", submitLabel: "确认新邮箱并换绑", inputMode: "numeric", icon: <MailCheck size={15} /> };
   }
   if (status === "phone") {
     return { action: "phone", placeholder: "+60123456789", submitLabel: "发送手机验证码", inputMode: "tel", icon: <Smartphone size={15} /> };
@@ -2391,6 +2492,7 @@ function operationLabel(type) {
     resume: "继续中断流程",
     setup_2fa: "设置 2FA",
     rotate_2fa: "更换 2FA",
+    change_email: "换绑邮箱",
     add_password: "添加密码",
     set_password: "设置统一密码",
     logout_all: "登出所有设备",

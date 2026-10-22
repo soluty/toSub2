@@ -26,4 +26,9 @@ totp-rotate-state.json
 totp-rotate-state.json.*.tmp
 totp-rotate-result.json
 totp-rotate-result.json.*.tmp
+email-change-state.json
+email-change-state.json.*.tmp
+email-change-checkpoint.json
+email-change-checkpoint.json.*.tmp
+email-change-old-oauth.json
 sub2api-monitor.json

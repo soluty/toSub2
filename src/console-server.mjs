@@ -21,6 +21,8 @@ import { LOGOUT_RESULT_FILENAME, readLogoutResult, writeLogoutResult } from "./a
 import { validateAccountPassword } from "./password-policy.mjs";
 import { PASSWORD_SET_STATE_FILENAME, readPasswordState, writePasswordJson } from "./password-set.mjs";
 import { TOTP_ROTATE_STATE_FILENAME, TOTP_ROTATE_RESULT_FILENAME, readTotpRotationJson, writeTotpRotationJson } from "./totp-rotate.mjs";
+import { EMAIL_CHANGE_STATE_FILENAME, EMAIL_CHANGE_CHECKPOINT_FILENAME, EMAIL_CHANGE_OLD_OUTPUT_FILENAME,
+  readEmailChangeState, writeEmailChangeState, emailChangeSummary } from "./email-change.mjs";
 import { normalizeAnnotationsPatch, restoreAnnotations, mergeAnnotations, effectiveAccountType,
   normalizeAccountFilters, matchesAccountFilters, accountFacets, observedAccountType } from "./account-annotations.mjs";
 
@@ -125,6 +127,7 @@ if (!Number.isInteger(requestedPort) || requestedPort < 1 || requestedPort > 655
 await fs.mkdir(OUTPUT_ROOT, { recursive: true });
 await loadSub2ApiMonitorConfiguration();
 await syncCompletedOutputs(true);
+await restoreEmailChangeOperations();
 await restoreLogoutOperations();
 await restorePasswordSetOperations();
 await restoreTotpRotationOperations();
@@ -145,7 +148,7 @@ const vite = await createViteServer({
         ".env", ".env.*", "*.{crt,pem}", "**/.git/**",
         `${normalizePath(OUTPUT_ROOT)}/**`, `${normalizePath(LINUX_CREDENTIAL_ROOT)}/**`,
         "**/.credentials/**", "**/credentials.json", "**/.credentials.*.tmp",
-        "**/{password-add-result,password-set-state,totp-setup-result,totp-rotate-state,totp-rotate-result,job-meta,login-checkpoint,sub2api-monitor}.json{,.*.tmp}",
+        "**/{password-add-result,password-set-state,totp-setup-result,totp-rotate-state,totp-rotate-result,email-change-state,email-change-checkpoint,email-change-old-oauth,job-meta,login-checkpoint,sub2api-monitor}.json{,.*.tmp}",
       ],
     },
   },
@@ -227,6 +230,7 @@ async function handleApi(req, res, requestUrl) {
         uniqueEmail: true,
         accountAnnotations: true,
         accountStatusFilter: true,
+        emailChange: true,
         smsProviders: publicSmsProviderDefinitions(),
         queue: true,
         sourceExport: true,
@@ -309,6 +313,7 @@ async function handleApi(req, res, requestUrl) {
     const hasProxyUpdate = Object.hasOwn(body, "proxyUrl");
     const proxyUrl = hasProxyUpdate ? normalizeProxyUrl(body.proxyUrl) : null;
     const result = await withEmailJobLock(email, async () => {
+      assertEmailNotReserved(email);
       const existing = findJobByEmail(email);
       if (existing) {
         if (hasCredentialUpdate) await updateJobCredentials(existing, credentials, { proxyUrl, hasProxyUpdate });
@@ -330,6 +335,7 @@ async function handleApi(req, res, requestUrl) {
     const proxyUrl = normalizeProxyUrl(body.proxyUrl);
     const hasProxyUpdate = Object.hasOwn(body, "proxyUrl");
     const results = await Promise.all(entries.map((entry) => withEmailJobLock(entry.email, async () => {
+      assertEmailNotReserved(entry.email);
       const existing = findJobByEmail(entry.email);
       if (existing) {
         if (!entry.annotationsOnly) {
@@ -626,7 +632,7 @@ async function handleApi(req, res, requestUrl) {
     return;
   }
 
-  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|add-password|logout-all|resume-auto-repair|logs|download|totp-rotation-recovery|sms-number|luban-number))?$/.exec(requestUrl.pathname);
+  const match = /^\/api\/jobs\/([a-f0-9-]+)(?:\/(input|cancel|retry|regenerate|relogin|setup-2fa|add-password|logout-all|resume-auto-repair|logs|download|totp-rotation-recovery|change-email|verify-email-change|finish-email-change|sms-number|luban-number))?$/.exec(requestUrl.pathname);
   if (!match) {
     sendJson(res, 404, { error: "Not found" });
     return;
@@ -639,8 +645,33 @@ async function handleApi(req, res, requestUrl) {
   }
 
   const action = match[2];
+  if (req.method === "POST" && isEmailChangeBlocked(job) && !["input", "cancel", "verify-email-change", "finish-email-change"].includes(action)) {
+    throw httpError(409, "请先完成或核实邮箱换绑，再执行其他账号操作");
+  }
   if (req.method === "POST" && isTotpRotationBlocked(job) && !["input", "cancel"].includes(action)) {
     throw httpError(409, "请先等待或核实 2FA 更换结果；核实后可重新导入当前有效的密钥");
+  }
+  if (req.method === "POST" && action === "change-email") {
+    const body = await readJson(req);
+    const newEmail = String(body.newEmail || "").trim().toLowerCase();
+    if (!isEmail(newEmail)) throw httpError(400, "新邮箱格式不正确");
+    if (body.confirmed !== true) throw httpError(400, "请确认将此账号换绑到新邮箱");
+    await withEmailChangeLocks(job.email, newEmail, () => startEmailChange(job, { ...body, newEmail }));
+    sendJson(res, 202, { job: publicJob(job) });
+    return;
+  }
+  if (req.method === "POST" && action === "verify-email-change") {
+    await withEmailJobLock(job.email, () => startEmailChangeVerification(job));
+    sendJson(res, 202, { job: publicJob(job) });
+    return;
+  }
+  if (req.method === "POST" && action === "finish-email-change") {
+    await withEmailJobLock(job.email, async () => {
+      if (isEmailChangeRunning(job) || !job.emailChange?.confirmed) throw httpError(409, "当前没有可继续保存的换绑结果");
+      await finishEmailChange(job, null, true);
+    });
+    sendJson(res, 200, { job: publicJob(job) });
+    return;
   }
   if (req.method === "POST" && action === "logout-all") {
     const body = await readJson(req);
@@ -882,6 +913,7 @@ function scheduleQueuedJobs() {
     job.queueRunId = queueRunId;
     job.status = mode === "refresh"
       ? "refreshing"
+      : ["email_change", "email_change_verify"].includes(mode) ? "email_change_starting"
       : mode === "logout_all"
         ? "logout_starting"
       : mode === "password_set"
@@ -910,13 +942,18 @@ function scheduleQueuedJobs() {
 
 async function prepareAndLaunchJob(job, mode, queueRunId) {
   try {
-    const needsMailboxBaseline = ["full", "totp_setup", "totp_rotate", "password_add", "logout_all"].includes(mode)
+    const needsMailboxBaseline = ["full", "totp_setup", "totp_rotate", "password_add", "logout_all", "email_change"].includes(mode)
       || (mode === "password_set" && !job.password && !job.hasPasswordCredential);
     if (needsMailboxBaseline && job.mailApiUrl) await loadMailboxBaseline(job);
     if (!isActive(job.status) || job.status === "queued" || job.queueRunId !== queueRunId) return;
     launchJob(job, { mode });
   } catch (error) {
     if (job.queueRunId !== queueRunId || job.deleted) return;
+    if (["email_change", "email_change_verify"].includes(mode)) {
+      await finishEmailChange(job, "换绑邮箱的准备未完成");
+      scheduleQueuedJobs();
+      return;
+    }
     if (mode === "totp_rotate") {
       await finishTotpRotation(job, "更换 2FA 的准备未完成");
       scheduleQueuedJobs();
@@ -964,7 +1001,16 @@ function launchJob(job, options = {}) {
   job.runId = runId;
   job.runMode = mode;
   job.mailOtpRequestedAt = null;
-  const args = mode === "logout_all"
+  if (["email_change", "email_change_verify"].includes(mode)) {
+    job.emailChangeMailboxPhase = false;
+    job.emailChangeMailboxRequestId = null;
+    job.emailChangeAutoMailDisabled = false;
+  }
+  const args = ["email_change", "email_change_verify"].includes(mode)
+    ? [PROTOCOL_SCRIPT, "--email", job.emailChange.oldEmail,
+      mode === "email_change" ? "--change-email" : "--verify-email-change", "--email-change-state", emailChangeStatePath(job),
+      "--checkpoint", emailChangeCheckpointPath(job), "--verbose"]
+    : mode === "logout_all"
     ? [PROTOCOL_SCRIPT, "--email", job.email, "--logout-all-devices",
         "--resume-checkpoint", job.checkpointPath,
         "--logout-result", logoutResultPath(job), "--logout-operation-id", job.logout.operationId, "--verbose"]
@@ -1019,6 +1065,7 @@ function launchJob(job, options = {}) {
         job.checkpointPath,
         "--verbose",
       ];
+  if (mode === "full" && job.emailChange?.confirmed && job.emailChange.state === "authorization_pending") args.push("--existing-account-only");
   const child = spawn(process.execPath, args, {
     cwd: WORKSPACE_ROOT,
     env: {
@@ -1026,6 +1073,9 @@ function launchJob(job, options = {}) {
       CHATGPT_LOGIN_PASSWORD: job.password || "",
       CHATGPT_TOTP_SECRET: job.totpSecret || "",
       CHATGPT_TOTP_ROTATE_ID: mode === "totp_rotate" ? job.totpRotation.operationId : "",
+      CHATGPT_EMAIL_CHANGE_ID: job.emailChange?.operationId || "",
+      CHATGPT_EMAIL_CHANGE_JOB_ID: job.id,
+      CHATGPT_EMAIL_CHANGE_EXPECTED_USER_ID: job.emailChange?.state === "authorization_pending" ? job.emailChangeIdentity?.authUserId || "" : "",
       CHATGPT_NEW_PASSWORD: mode === "password_set" ? job.pendingUniformPassword || "" : mode === "password_add" ? job.pendingNewPassword || "" : "",
       CHATGPT_PASSWORD_SET_ID: mode === "password_set" ? job.passwordSet.operationId : "",
       CHATGPT_PROXY_URL: job.proxyUrl || "",
@@ -1047,7 +1097,8 @@ function launchJob(job, options = {}) {
   child.on("error", (error) => {
     void withEmailJobLock(job.email, async () => {
       if (job.runId !== runId) return;
-      if (mode === "totp_rotate") await finishTotpRotation(job, "无法启动 2FA 更换进程");
+      if (["email_change", "email_change_verify"].includes(mode)) await finishEmailChange(job, "无法启动换绑邮箱进程");
+      else if (mode === "totp_rotate") await finishTotpRotation(job, "无法启动 2FA 更换进程");
       else if (mode === "password_set") await finishPasswordSet(job, "无法启动统一密码设置进程");
       else if (mode === "logout_all") await finishLogoutAll(job, "无法启动登出进程");
       else if (mode === "totp_setup") restoreTotpSetupFailure(job, `无法启动 2FA 设置进程：${error.message}`);
@@ -1067,6 +1118,16 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
   if (job.runId !== runId) return;
   stopMailPolling(job);
   job.child = null;
+  if (["email_change", "email_change_verify"].includes(mode)) {
+    await finishEmailChange(job, signal ? "换绑进程已停止" : null, true);
+    scheduleQueuedJobs();
+    return;
+  }
+  if (mode === "full" && job.emailChange?.confirmed && job.emailChange.state === "authorization_pending") {
+    await finishEmailChangeAuthorization(job);
+    scheduleQueuedJobs();
+    return;
+  }
   if (mode === "totp_rotate") {
     await finishTotpRotation(job);
     scheduleQueuedJobs();
@@ -1125,9 +1186,18 @@ async function handleChildClose(job, { code, signal, mode, runId }) {
 }
 
 function handleChildCloseFailure(job, mode, runId, error) {
-  if (job.runId !== runId && !(["totp_setup", "totp_rotate", "password_add", "password_set", "logout_all"].includes(mode) && job.runId === null)) return;
+  if (job.runId !== runId && !(((["totp_setup", "totp_rotate", "password_add", "password_set", "logout_all", "email_change", "email_change_verify"].includes(mode))
+    || (mode === "full" && job.emailChange?.state === "authorization_pending")) && job.runId === null)) return;
   const message = `收尾处理失败：${error.message}`;
-  if (mode === "totp_rotate") {
+  if (["email_change", "email_change_verify"].includes(mode) || (mode === "full" && job.emailChange?.state === "authorization_pending")) {
+    job.status = "reauth_required";
+    job.emailChange.state = job.emailChange.confirmed ? "migration_failed" : "unknown";
+    job.emailChangeError = "换绑收尾未完成，请使用核实结果或继续保存；私有操作记录已保留";
+    job.prompt = "邮箱换绑结果需要继续处理";
+    job.autoRepairPaused = true;
+    job.runMode = null;
+    job.runId = null;
+  } else if (mode === "totp_rotate") {
     job.status = "reauth_required";
     job.prompt = "2FA 更换结果尚未保存完成，请重启服务恢复";
     job.totpRotationError = "私有操作记录已保留，新密钥不会重复生成";
@@ -1165,6 +1235,7 @@ function handleChildCloseFailure(job, mode, runId, error) {
 }
 
 async function retryJob(job, options = {}) {
+  if (isEmailChangeBlocked(job)) throw httpError(409, "请先完成或核实邮箱换绑");
   if (isTotpRotationBlocked(job)) throw httpError(409, "请先等待或核实 2FA 更换结果");
   if (isPasswordSetRunning(job)) throw httpError(409, "统一密码设置正在进行中");
   if (isLogoutRunning(job)) throw httpError(409, "登出操作尚未结束，暂不能重新授权");
@@ -1218,6 +1289,7 @@ async function retryJob(job, options = {}) {
 }
 
 async function regenerateJob(job, options = {}) {
+  if (isEmailChangeBlocked(job)) throw httpError(409, "请先完成或核实邮箱换绑");
   if (isTotpRotationBlocked(job)) throw httpError(409, "请先等待或核实 2FA 更换结果");
   if (isLogoutRunning(job)) throw httpError(409, "登出操作尚未结束，暂不能刷新授权");
   if (job.status !== "completed" || !job.resultSaved) {
@@ -1334,7 +1406,7 @@ function isLogoutRunning(job) {
 }
 
 function canLogoutAll(job) {
-  return !shuttingDown && !isLogoutRunning(job) && !isPasswordSetRunning(job) && !isTotpRotationBlocked(job)
+  return !shuttingDown && !isLogoutRunning(job) && !isPasswordSetRunning(job) && !isTotpRotationBlocked(job) && !isEmailChangeBlocked(job)
     && !["totp_setup", "password_add"].includes(job.runMode)
     && !(job.status === "queued" && ["totp_setup", "password_add"].includes(job.queuedMode));
 }
@@ -1426,6 +1498,359 @@ async function restoreLogoutOperations() {
   }
 }
 
+function emailChangeStatePath(job) { return path.join(path.dirname(job.outputPath), EMAIL_CHANGE_STATE_FILENAME); }
+function emailChangeCheckpointPath(job) { return path.join(path.dirname(job.outputPath), EMAIL_CHANGE_CHECKPOINT_FILENAME); }
+
+function isEmailChangeRunning(job) {
+  return Boolean(job.emailChangeFinishPromise || job.emailChangeAuthorizationPromise) || ["email_change", "email_change_verify"].includes(job.runMode)
+    || (job.status === "queued" && ["email_change", "email_change_verify"].includes(job.queuedMode))
+    || (job.emailChange?.state === "authorization_pending" && (job.runMode === "full" || job.status === "queued"));
+}
+
+function isEmailChangeBlocked(job) {
+  return isEmailChangeRunning(job) || ["unknown", "migration_failed", "confirmed"].includes(job.emailChange?.state);
+}
+
+function emailChangeReservesAddresses(job) {
+  return isEmailChangeRunning(job) || (job.emailChange && !["failed", "completed", "authorization_pending", "sync_pending"].includes(job.emailChange.state));
+}
+
+function assertEmailNotReserved(email, exceptId = null) {
+  const normalized = email.toLowerCase();
+  if ([...jobs.values()].some(job => job.id !== exceptId && emailChangeReservesAddresses(job)
+    && [job.emailChange?.oldEmail, job.emailChange?.newEmail].some(value => value?.toLowerCase() === normalized))) {
+    throw httpError(409, "该邮箱正在换绑或结果待核实，暂不能创建、导入或修改账号");
+  }
+}
+
+async function withEmailChangeLocks(oldEmail, newEmail, work) {
+  const keys = [...new Set([oldEmail.toLowerCase(), newEmail.toLowerCase()])].sort();
+  const lock = index => index === keys.length ? work() : withEmailJobLock(keys[index], () => lock(index + 1));
+  return lock(0);
+}
+
+function canChangeEmail(job) {
+  return !shuttingDown && isTerminalStatus(job.status) && !isEmailChangeBlocked(job)
+    && !["authorization_pending", "sync_pending"].includes(job.emailChange?.state)
+    && !isLogoutRunning(job) && !isPasswordSetRunning(job) && !isTotpRotationBlocked(job)
+    && job.passwordSet?.state !== "unknown" && !["totp_setup", "password_add"].includes(job.runMode);
+}
+
+async function persistEmailChange(job, state) {
+  await writeEmailChangeState(emailChangeStatePath(job), state);
+  job.emailChange = emailChangeSummary(state);
+  job.emailChangeError = state.error || null;
+  job.emailChangeTargetMailApiUrl = state.targetMailApiUrl || null;
+  job.emailChangeIdentity = state.identity || null;
+}
+
+async function startEmailChange(job, options) {
+  if (!canChangeEmail(job)) throw httpError(409, "请等待当前账号操作结束，并先处理待核实的安全操作");
+  if (job.email.toLowerCase() === options.newEmail) throw httpError(400, "新邮箱不能与原邮箱相同");
+  assertEmailNotReserved(options.newEmail, job.id);
+  const occupied = findJobByEmail(options.newEmail);
+  if (occupied && occupied.id !== job.id) throw httpError(409, "目标邮箱已有本地账号，不能覆盖或合并");
+  const targetMailApiUrl = String(options.mailApiUrl || "").trim();
+  if (targetMailApiUrl && !validateMailApiUrl(targetMailApiUrl)) throw httpError(400, "新邮箱收码 API 必须是有效的 HTTP 或 HTTPS 地址");
+  if (options.syncSub2api && !sub2ApiMonitorConfig?.adminApiKey) throw httpError(400, "请先配置 Sub2API，或取消同步选项");
+  await reloadMissingJobCredentials(job);
+  const state = { version: 1, jobId: job.id, operationId: crypto.randomUUID(), oldEmail: job.email,
+    newEmail: options.newEmail, targetMailApiUrl: targetMailApiUrl || null, state: "preparing", confirmed: false,
+    localCommitted: false, previousStatus: job.status, previousAutoRepairPaused: Boolean(job.autoRepairPaused),
+    syncSub2api: Boolean(options.syncSub2api), remoteAccountIds: [], startedAt: new Date().toISOString() };
+  // 在短锁内预留两个地址；等待验证码时不会持有邮箱锁。
+  job.emailChange = emailChangeSummary(state);
+  job.runMode = "email_change";
+  try {
+    await persistEmailChange(job, state);
+    await removePrivateFile(emailChangeCheckpointPath(job));
+    job.autoRepairPaused = true;
+    job.emailChangeError = null;
+    job.parserTail = "";
+    job.lastError = null;
+    job.status = "email_change_starting";
+    recordJobOperation(job, "change_email");
+    await saveJobMetadata(job);
+  } catch {
+    job.runMode = null;
+    job.status = state.previousStatus;
+    job.emailChange = { ...emailChangeSummary(state), state: "failed" };
+    job.autoRepairPaused = state.previousAutoRepairPaused;
+    throw httpError(500, "无法保存换绑记录，尚未开始平台操作");
+  }
+  appendJobLog(job, "[email-change] 已登记单账号换绑，先验证原账号并检查平台资格。\n");
+  enqueueJob(job, "email_change", "正在验证原账号并检查换绑资格");
+}
+
+async function startEmailChangeVerification(job) {
+  if (isEmailChangeRunning(job) || job.emailChange?.state !== "unknown") throw httpError(409, "当前没有需要核实的换绑操作");
+  const state = await readEmailChangeState(emailChangeStatePath(job), job.id, job.emailChange.operationId);
+  if (!state?.identity?.userId) throw httpError(409, "缺少原账号身份记录，请在官方页面核实账号状态");
+  job.emailChangeTargetMailApiUrl = state.targetMailApiUrl || null;
+  job.emailChangeIdentity = state.identity;
+  job.emailChangeError = null;
+  job.parserTail = "";
+  enqueueJob(job, "email_change_verify", "正在用新邮箱核实结果，不重新提交换绑");
+}
+
+async function prepareEmailChangeMailbox(job, requestId) {
+  const runId = job.runId;
+  job.emailChangeMailboxRequestId = requestId;
+  job.emailChangeMailboxPhase = true;
+  stopMailPolling(job);
+  job.mailSeenCandidateKeys.clear();
+  job.mailCandidateCounts.clear();
+  setStage(job, "email_change_starting", "换绑资格已通过，正在准备新邮箱验证");
+  try {
+    const state = await readEmailChangeState(emailChangeStatePath(job), job.id, job.emailChange.operationId);
+    if (!state) throw httpError(409, "换绑状态记录不可用");
+    if (state.syncSub2api && !state.remoteCaptured) {
+      const config = sub2ApiMonitorConfig;
+      if (!config?.adminApiKey) throw httpError(409, "Sub2API 配置不可用，尚未发送新邮箱验证码");
+      const matches = (await listSub2ApiErrorAccounts(config, null)).filter(account => sub2ApiAccountEmail(account) === state.oldEmail.toLowerCase());
+      if (matches.length > 1) throw httpError(409, "Sub2API 中存在多个同邮箱账号，请核对关联或取消同步选项后再换绑");
+      state.remoteAccountIds = matches.map(account => Number(account.id)).filter(id => Number.isSafeInteger(id) && id > 0);
+      state.remoteBackend = monitorBackendIdentity(config);
+      state.remoteCaptured = true;
+      if (job.runId !== runId) return;
+      await persistEmailChange(job, state);
+    }
+    if (job.runId !== runId) return;
+    if (job.emailChangeTargetMailApiUrl) {
+      try {
+        const candidates = await fetchMailboxOtpCandidates(job.emailChangeTargetMailApiUrl, { timeoutMs: 10_000, request: { method: "GET" } });
+        if (job.runId !== runId) return;
+        candidates.forEach(candidate => job.mailSeenCandidateKeys.add(candidate.key));
+        job.emailChangeAutoMailDisabled = false;
+        job.mailApiError = null;
+      } catch {
+        if (job.runId !== runId) return;
+        job.emailChangeAutoMailDisabled = true;
+        job.mailApiError = "新邮箱收码接口准备失败，请手动输入验证码";
+        appendJobLog(job, "[email-change] 新邮箱收码接口暂不可用，将等待手动验证码。\n");
+      }
+    }
+    if (job.runId === runId && job.child) {
+      job.parserTail = "";
+      job.child.stdin.write("ready\n");
+    }
+  } catch (error) {
+    if (job.runId !== runId || !job.child) return;
+    job.emailChangeError = error.status ? error.message : "准备新邮箱验证失败，尚未发送新邮箱验证码";
+    job.child.stdin.write("q\n");
+    touch(job);
+  }
+}
+
+async function finishEmailChange(job, interruptedMessage = null, authorize = false) {
+  if (job.emailChangeFinishPromise) return job.emailChangeFinishPromise;
+  const work = performFinishEmailChange(job, interruptedMessage, authorize);
+  job.emailChangeFinishPromise = work;
+  try { await work; }
+  finally { if (job.emailChangeFinishPromise === work) job.emailChangeFinishPromise = null; }
+}
+
+async function performFinishEmailChange(job, interruptedMessage, authorize) {
+  const operation = job.emailChange;
+  const state = await readEmailChangeState(emailChangeStatePath(job), job.id, operation.operationId);
+  stopMailPolling(job);
+  job.child = null;
+  job.queueRunId = null;
+  job.queuedMode = null;
+  job.queuedAt = null;
+  if (!state?.confirmed) {
+    const unknown = !state || ["submitting", "verifying_identity", "unknown"].includes(state.state);
+    const next = { ...(state || operation), state: unknown ? "unknown" : "failed", updatedAt: new Date().toISOString(),
+      error: job.emailChangeError || state?.error || interruptedMessage || (unknown ? "换绑结果待核实，不会自动重新提交" : "换绑尚未完成，原邮箱未更新") };
+    await persistEmailChange(job, next);
+    job.autoRepairPaused = unknown || Boolean(operation.previousAutoRepairPaused);
+    job.status = unknown ? "reauth_required" : isTerminalStatus(state?.previousStatus) ? state.previousStatus : job.resultSaved ? "completed" : "reauth_required";
+    job.prompt = unknown ? "邮箱换绑结果待核实，请使用“核实换绑”" : "换绑未完成，原邮箱保留";
+    job.runMode = null;
+    job.runId = null;
+    job.parserTail = "";
+    await saveJobMetadata(job);
+    touch(job);
+    return;
+  }
+  try {
+    assertEmailNotReserved(state.newEmail, job.id);
+    const occupied = [...jobs.values()].some(item => item.id !== job.id && item.email.toLowerCase() === state.newEmail.toLowerCase());
+    if (occupied) throw new Error("目标邮箱发生本地冲突");
+    if (!state.localCommitted) {
+      const stored = await loadStoredLoginCredentials(state.oldEmail);
+      const credentials = { password: job.password || stored.password, totpSecret: job.totpSecret || stored.totpSecret, proxyUrl: job.proxyUrl || stored.proxyUrl };
+      if (!await saveStoredLoginCredentials(state.newEmail, credentials)) throw new Error("无法持久保存新邮箱凭据");
+      if (await fileExists(job.outputPath)) {
+        const output = JSON.parse(await fs.readFile(job.outputPath, "utf8"));
+        const outputEmail = output.accounts?.[0]?.credentials?.email?.toLowerCase();
+        if (outputEmail === state.oldEmail.toLowerCase()) {
+          await fs.rename(job.outputPath, path.join(path.dirname(job.outputPath), EMAIL_CHANGE_OLD_OUTPUT_FILENAME));
+        } else if (outputEmail !== state.newEmail.toLowerCase()) throw new Error("授权文件账号不一致");
+      }
+      job.email = state.newEmail;
+      job.emailHistory = [...new Set([...(job.emailHistory || []), state.oldEmail])];
+      Object.assign(job, credentials);
+      job.mailApiUrl = state.targetMailApiUrl || null;
+      job.mailRequestBody = "";
+      job.mailRequestMethod = "GET";
+      job.hasPasswordCredential = Boolean(job.password || job.hasPasswordCredential);
+      job.hasTotpCredential = Boolean(job.totpSecret || job.hasTotpCredential);
+      job.resultSaved = false;
+      if (await fileExists(emailChangeCheckpointPath(job))) {
+        const checkpoint = JSON.parse(await fs.readFile(emailChangeCheckpointPath(job), "utf8"));
+        if (checkpoint.email?.toLowerCase() !== state.newEmail.toLowerCase()) throw new Error("新检查点账号不一致");
+        await fs.rename(emailChangeCheckpointPath(job), job.checkpointPath);
+      } else if (await fileExists(job.checkpointPath)) {
+        const checkpoint = JSON.parse(await fs.readFile(job.checkpointPath, "utf8"));
+        if (checkpoint.email?.toLowerCase() !== state.newEmail.toLowerCase()) await removePrivateFile(job.checkpointPath);
+      }
+      await removePrivateFile(job.passwordAddResultPath);
+      await removePrivateFile(job.totpResultPath);
+      job.loginCheckpointAvailable = await fileExists(job.checkpointPath);
+      await saveJobMetadata(job);
+      state.localCommitted = true;
+      state.state = "authorization_pending";
+      state.error = null;
+      await persistEmailChange(job, state);
+    }
+    // 先确认新键与任务资料已保存，再清理旧键；失败时保留操作记录以便继续。
+    if (!state.oldCredentialsRemoved) {
+      const oldAddressOwner = [...jobs.values()].some(item => item.id !== job.id && item.email.toLowerCase() === state.oldEmail.toLowerCase());
+      if (oldAddressOwner) throw new Error("原邮箱已经被其他本地任务使用，停止清理凭据");
+      await deleteStoredLoginCredentials(state.oldEmail);
+      state.oldCredentialsRemoved = true;
+      await persistEmailChange(job, state);
+    }
+    job.email = state.newEmail;
+    job.emailChangeIdentity = state.identity || null;
+    job.emailChangeTargetMailApiUrl = state.targetMailApiUrl || null;
+    job.emailChangeError = null;
+    job.autoRepairPaused = true;
+    job.runMode = null;
+    job.runId = null;
+    job.parserTail = "";
+    job.status = "reauth_required";
+    job.prompt = "邮箱已换绑并保存，正在准备更新授权";
+    state.state = state.oauthCompleted ? (state.remotePendingIds?.length ? "sync_pending" : "completed") : "authorization_pending";
+    await persistEmailChange(job, state);
+    await saveJobMetadata(job);
+    if (state.oauthCompleted || await emailChangeOutputMatches(job, state)) {
+      await finishEmailChangeAuthorization(job, authorize);
+    } else if (authorize && !shuttingDown) {
+      beginAuthorizationAutomationAttempt(job, "email_change");
+      enqueueJob(job, "full", "邮箱已换绑，正在获取新邮箱的授权文件");
+    } else {
+      job.prompt = "邮箱已换绑并保存，点击重新授权更新授权文件";
+      job.emailChangeError = "邮箱换绑已完成，授权更新尚未完成";
+      await saveJobMetadata(job);
+    }
+  } catch {
+    state.state = "migration_failed";
+    state.error = "平台已确认换绑，但本地保存未完成，请点击继续保存或重启服务恢复；不会重复换绑";
+    await persistEmailChange(job, state);
+    job.autoRepairPaused = true;
+    job.runMode = null;
+    job.runId = null;
+    job.status = "reauth_required";
+    job.prompt = "邮箱已换绑，本地资料需要继续保存";
+    await saveJobMetadata(job);
+  }
+  touch(job);
+}
+
+async function emailChangeOutputMatches(job, state) {
+  try {
+    const data = JSON.parse(await fs.readFile(job.outputPath, "utf8"));
+    const account = data.accounts?.[0];
+    return data.type === "sub2api-data" && account?.credentials?.email?.toLowerCase() === state.newEmail.toLowerCase()
+      && typeof account.credentials.access_token === "string" && Boolean(account.credentials.access_token)
+      && (!state.identity?.authUserId || account.extra?.chatgpt_user_id === state.identity.authUserId);
+  } catch { return false; }
+}
+
+async function syncEmailChangeSub2Api(job, state) {
+  if (!state.remotePendingIds?.length) return;
+  const config = sub2ApiMonitorConfig;
+  if (!config?.adminApiKey || monitorBackendIdentity(config) !== state.remoteBackend) throw new Error("Sub2API 配置已变化");
+  const output = JSON.parse(await fs.readFile(job.outputPath, "utf8"));
+  const fresh = output.accounts[0];
+  for (const id of [...state.remotePendingIds]) {
+    const remote = await getSub2ApiAccount(config, id);
+    if (!remote || ![state.oldEmail.toLowerCase(), state.newEmail.toLowerCase()].includes(sub2ApiAccountEmail(remote))) throw new Error("Sub2API 原账号关联已变化");
+    await requestSub2Api(config, `/api/v1/admin/accounts/${id}`, { method: "PUT", body: JSON.stringify({
+      credentials: { ...remote.credentials, ...fresh.credentials },
+      extra: { ...remote.extra, email: state.newEmail, chatgpt_user_id: fresh.extra?.chatgpt_user_id },
+    }) });
+    state.remotePendingIds = state.remotePendingIds.filter(value => value !== id);
+    await persistEmailChange(job, state);
+  }
+}
+
+async function finishEmailChangeAuthorization(job, sync = true) {
+  if (job.emailChangeAuthorizationPromise) return job.emailChangeAuthorizationPromise;
+  const work = performFinishEmailChangeAuthorization(job, sync);
+  job.emailChangeAuthorizationPromise = work;
+  try { await work; }
+  finally { if (job.emailChangeAuthorizationPromise === work) job.emailChangeAuthorizationPromise = null; }
+}
+
+async function performFinishEmailChangeAuthorization(job, sync) {
+  const state = await readEmailChangeState(emailChangeStatePath(job), job.id, job.emailChange.operationId);
+  if (!state?.confirmed || !state.localCommitted) throw new Error("缺少已保存的换绑结果");
+  job.runMode = null;
+  job.runId = null;
+  job.child = null;
+  job.queueRunId = null;
+  job.queuedMode = null;
+  job.queuedAt = null;
+  if (!await emailChangeOutputMatches(job, state)) {
+    state.state = "authorization_pending";
+    state.error = "邮箱已换绑并保存，新邮箱授权尚未完成；可继续重新授权";
+    job.resultSaved = false;
+    job.status = "reauth_required";
+    job.prompt = state.error;
+    job.autoRepairPaused = true;
+  } else {
+    state.oauthCompleted = true;
+    state.remotePendingIds ||= [...(state.remoteAccountIds || [])];
+    state.state = state.remotePendingIds.length ? "sync_pending" : "completed";
+    state.error = null;
+    job.resultSaved = true;
+    job.status = "completed";
+    job.completedAt = new Date().toISOString();
+    job.loginCheckpointAvailable = false;
+    await removePrivateFile(job.checkpointPath);
+    const data = JSON.parse(await fs.readFile(job.outputPath, "utf8"));
+    job.observedAccountType = observedAccountType(data.accounts[0]);
+    if (job.authAutomationAttempt) completeAuthorizationAutomationAttempt(job);
+    if (sync && state.remotePendingIds.length) {
+      try { await syncEmailChangeSub2Api(job, state); }
+      catch { state.error = "邮箱和本地授权已更新，Sub2API 同步未完成；点击继续保存重试同步"; }
+    }
+    state.state = state.remotePendingIds.length ? "sync_pending" : "completed";
+    if (state.state === "sync_pending") state.error ||= "邮箱和本地授权已更新，Sub2API 关联仍待同步";
+    job.prompt = state.state === "completed" ? "邮箱换绑完成，资料和授权已更新" : "邮箱换绑完成，Sub2API 同步待完成";
+    job.autoRepairPaused = state.state === "sync_pending" || Boolean(state.previousAutoRepairPaused);
+  }
+  await persistEmailChange(job, state);
+  await saveJobMetadata(job);
+  touch(job);
+}
+
+async function restoreEmailChangeOperations() {
+  for (const job of jobs.values()) {
+    if (!job.emailChange || ["completed", "failed"].includes(job.emailChange.state)) continue;
+    try { await finishEmailChange(job, "服务重启中断了换绑流程", false); }
+    catch {
+      job.emailChange.state = "unknown";
+      job.emailChangeError = "换绑记录无法恢复，请先核实账号状态";
+      job.autoRepairPaused = true;
+      job.status = "reauth_required";
+    }
+  }
+}
+
 function totpRotationStatePath(job) {
   return path.join(path.dirname(job.outputPath), TOTP_ROTATE_STATE_FILENAME);
 }
@@ -1443,7 +1868,7 @@ function isTotpRotationBlocked(job) {
 }
 
 function canRotateTotp(job) {
-  if (shuttingDown || isTotpRotationBlocked(job) || isLogoutRunning(job) || isPasswordSetRunning(job)) return false;
+  if (shuttingDown || isTotpRotationBlocked(job) || isLogoutRunning(job) || isPasswordSetRunning(job) || isEmailChangeBlocked(job)) return false;
   return Boolean(job.totpSecret) && isTerminalStatus(job.status)
     && !["totp_setup", "password_add"].includes(job.runMode);
 }
@@ -1635,7 +2060,7 @@ function isPasswordSetRunning(job) {
 }
 
 function canSetPassword(job) {
-  if (shuttingDown || isLogoutRunning(job) || isPasswordSetRunning(job) || isTotpRotationBlocked(job)
+  if (shuttingDown || isLogoutRunning(job) || isPasswordSetRunning(job) || isTotpRotationBlocked(job) || isEmailChangeBlocked(job)
     || ["password_add", "totp_setup"].includes(job.runMode)) return false;
   return isTerminalStatus(job.status) || (job.loginCheckpointAvailable && ["phone", "phone_otp"].includes(job.status));
 }
@@ -2067,6 +2492,37 @@ function consumeOutput(job, rawText) {
   const mailRequestMarkers = [...scan.matchAll(/\[email-otp-requested-at\]\s+(\S+)/g)];
   const latestMailRequestAt = Date.parse(mailRequestMarkers.at(-1)?.[1] || "");
   if (Number.isFinite(latestMailRequestAt)) job.mailOtpRequestedAt = latestMailRequestAt;
+  if (["email_change", "email_change_verify"].includes(job.runMode)) {
+    const mailboxRequestId = [...scan.matchAll(/\[email-change-mailbox-prepare\]\s+(\d+)/g)].at(-1)?.[1];
+    if (mailboxRequestId && mailboxRequestId !== job.emailChangeMailboxRequestId) {
+      job.parserTail = "";
+      void prepareEmailChangeMailbox(job, mailboxRequestId);
+      return;
+    }
+    if (scan.includes("New email OTP (6 digits, q=quit):")) {
+      const rejected = scan.includes("[email-change-code-rejected]");
+      setStage(job, "email_change_otp", rejected ? "新邮箱验证码错误或已过期，请重新输入"
+        : job.emailChangeTargetMailApiUrl && !job.emailChangeAutoMailDisabled
+          ? "正在等待新邮箱收码接口，也可手动输入新邮箱验证码" : `请输入发送到 ${job.emailChange.newEmail} 的验证码`);
+      if (job.emailChangeTargetMailApiUrl && !job.emailChangeAutoMailDisabled) void beginMailPolling(job);
+      return;
+    }
+    if (text.includes("[email-change-eligibility]")) {
+      job.parserTail = "";
+      setStage(job, "email_change_starting", "正在检查平台是否允许换绑，尚未发送新邮箱验证码");
+      return;
+    }
+    if (text.includes("[email-change-submitting]") || text.includes("[email-change-confirmed]")) {
+      job.parserTail = "";
+      setStage(job, "working", text.includes("[email-change-confirmed]") ? "新邮箱身份已确认，正在保存资料" : "正在提交新邮箱验证并核实结果");
+      return;
+    }
+    if (scan.includes("[security-check-required]") || scan.includes("ACCOUNT_PROFILE_REQUIRED")) {
+      job.emailChangeError = "原账号需要额外身份验证，换绑尚未完成";
+      touch(job);
+      return;
+    }
+  }
   if (scan.includes("[checkpoint] Saved verified email login state.")
     || scan.includes("[checkpoint] Updated verified login state after adding the password.")
     || scan.includes("[checkpoint] Updated verified login state after setting 2FA.")) {
@@ -2074,7 +2530,7 @@ function consumeOutput(job, rawText) {
   }
 
   if (scan.includes("[proxy-risk-retry]")) {
-    if (["logout_all", "password_set", "totp_rotate"].includes(job.runMode)) return;
+    if (["logout_all", "password_set", "totp_rotate", "email_change", "email_change_verify"].includes(job.runMode) || isEmailChangeRunning(job)) return;
     void restartAfterProxyRisk(job, {
       connectionFailure: scan.includes("PROXY_CONNECTION_RETRY"),
     }).catch((error) => {
@@ -2179,11 +2635,11 @@ function consumeOutput(job, rawText) {
       "email_otp",
       rejected
         ? "邮箱验证码错误，请重新输入或重新发送"
-        : job.mailApiUrl
+        : mailApiUrlForJob(job)
           ? "正在等待收码接口返回新验证码，也可以手动输入"
           : "请输入邮箱验证码",
     );
-    if (job.mailApiUrl) void beginMailPolling(job);
+    if (mailApiUrlForJob(job)) void beginMailPolling(job);
   }
   if (scan.includes("Password (q=quit):")) {
     markAuthorizationRequirement(job, "password");
@@ -2267,6 +2723,10 @@ function consumeOutput(job, rawText) {
     setStage(job, "finalizing", "账号已绑定手机号，正在继续授权");
   }
   if (scan.includes("[ok] Saved sub2api import:")) {
+    if (job.emailChange?.state === "authorization_pending") {
+      setStage(job, "finalizing", "新授权已生成，正在核对换绑后的账号身份");
+      return;
+    }
     job.resultSaved = true;
     setStage(job, "finalizing", "导入文件已生成，正在收尾");
   }
@@ -2277,7 +2737,10 @@ function consumeOutput(job, rawText) {
   const errorMatches = [...scan.matchAll(/\[error\]\s*([^\r\n]+)/g)];
   if (errorMatches.length) {
     const errorMessage = extractResponseMessage(errorMatches.at(-1)[1]);
-    if (job.runMode === "totp_rotate") {
+    if (["email_change", "email_change_verify"].includes(job.runMode)) {
+      job.emailChangeError = errorMessage;
+      touch(job);
+    } else if (job.runMode === "totp_rotate") {
       job.totpRotationError = errorMessage;
       touch(job);
     } else if (job.runMode === "password_set") {
@@ -2784,6 +3247,13 @@ async function submitJobInput(job, body, options = {}) {
     if (!/^\d{6}$/.test(value)) throw httpError(400, "设置 2FA 的验证码必须是 6 位数字");
     inputValue = value;
     setStage(job, "working", "正在激活新的 2FA");
+  } else if (action === "new_email_otp") {
+    requireStage(job, "email_change_otp");
+    if (!/^\d{6}$/.test(value)) throw httpError(400, "新邮箱验证码必须是 6 位数字");
+    stopMailPolling(job);
+    job.parserTail = "";
+    inputValue = value;
+    setStage(job, "working", "正在确认新邮箱验证码");
   } else if (action === "email_otp") {
     requireStage(job, "email_otp");
     if (!/^\d{6}$/.test(value)) throw httpError(400, "Email code must be 6 digits");
@@ -2847,7 +3317,22 @@ async function submitJobInput(job, body, options = {}) {
 }
 
 async function cancelJob(job) {
-  if (!isActive(job.status) && !isLogoutRunning(job) && !isPasswordSetRunning(job) && !isTotpRotationRunning(job)) return;
+  if (!isActive(job.status) && !isLogoutRunning(job) && !isPasswordSetRunning(job) && !isTotpRotationRunning(job) && !isEmailChangeRunning(job)) return;
+  if (isEmailChangeRunning(job)) {
+    if (job.emailChangeFinishPromise || job.emailChangeAuthorizationPromise) {
+      await (job.emailChangeFinishPromise || job.emailChangeAuthorizationPromise);
+      return;
+    }
+    const child = job.child;
+    job.runId = crypto.randomUUID();
+    job.queueRunId = null;
+    const exited = waitForChildExit(child, 3_000);
+    child?.kill("SIGTERM");
+    await exited;
+    await finishEmailChange(job, "用户已取消本次等待；如确认请求已发送，将保留待核实结果", false);
+    scheduleQueuedJobs();
+    return;
+  }
   if (isTotpRotationRunning(job)) {
     const child = job.child;
     job.runId = crypto.randomUUID();
@@ -3409,7 +3894,7 @@ async function getSub2ApiAccount(config, accountId) {
   }
 }
 
-async function listSub2ApiErrorAccounts(config) {
+async function listSub2ApiErrorAccounts(config, status = "error") {
   const accounts = [];
   let page = 1;
   let pages = 1;
@@ -3418,12 +3903,12 @@ async function listSub2ApiErrorAccounts(config) {
       page: String(page),
       page_size: "100",
       platform: "openai",
-      status: "error",
+      ...(status ? { status } : {}),
     });
     const payload = await requestSub2Api(config, `/api/v1/admin/accounts?${query}`);
     const data = payload?.data && typeof payload.data === "object" ? payload.data : payload;
     const items = Array.isArray(data?.items) ? data.items : Array.isArray(data) ? data : [];
-    accounts.push(...items.filter((account) => account && String(account.platform || "openai") === "openai" && String(account.status || "error") === "error"));
+    accounts.push(...items.filter((account) => account && String(account.platform || "openai") === "openai" && (!status || String(account.status || "error") === status)));
     const reportedPages = Number(data?.pages);
     pages = Number.isSafeInteger(reportedPages) && reportedPages > 0
       ? reportedPages
@@ -3461,6 +3946,7 @@ function isAutoRepairCoolingDown(job) {
 }
 
 function getAutoRepairEligibility(job) {
+  if (isEmailChangeBlocked(job) || ["authorization_pending", "sync_pending"].includes(job.emailChange?.state)) return { eligible: false, reason: "邮箱换绑或后续授权同步尚未完成，自动重登暂停" };
   if (isTotpRotationRunning(job) || ["unknown", "needs_setup", "save_failed"].includes(job.totpRotation?.state)) return { eligible: false, reason: "2FA 更换尚未完成或待核实，自动重登已暂停" };
   if (job.passwordSet?.state === "unknown") return { eligible: false, reason: "统一密码设置结果待核实，请先确认账号密码" };
   if (job.autoRepairPaused) return { eligible: false, reason: "登出操作已暂停自动重登，需要手动恢复" };
@@ -3621,6 +4107,11 @@ function publicJob(job) {
     id: job.id,
     email: job.email,
     annotations: restoreAnnotations(job.annotations),
+    emailChange: job.emailChange ? { oldEmail: job.emailChange.oldEmail, newEmail: job.emailChange.newEmail,
+      state: job.emailChange.state, confirmed: Boolean(job.emailChange.confirmed), error: job.emailChangeError || null } : null,
+    canChangeEmail: canChangeEmail(job),
+    canVerifyEmailChange: !isEmailChangeRunning(job) && job.emailChange?.state === "unknown",
+    canFinishEmailChange: !isEmailChangeRunning(job) && Boolean(job.emailChange?.confirmed) && ["migration_failed", "sync_pending"].includes(job.emailChange.state),
     accountType: effectiveAccountType(job),
     accountTypeSource: job.annotations?.type ? "manual" : job.observedAccountType ? "authorization" : "unset",
     status: job.status,
@@ -3664,9 +4155,9 @@ function publicJob(job) {
     smsStatus: job.smsStatus,
     smsError: job.smsError,
     securityCheckRequired: Boolean(job.securityCheckRequired),
-    canRetry: !isLogoutRunning(job) && !isTotpRotationBlocked(job) && ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
+    canRetry: !isLogoutRunning(job) && !isTotpRotationBlocked(job) && !isEmailChangeBlocked(job) && ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
     canResume: job.status === "resume_available",
-    canRegenerate: !isTotpRotationBlocked(job) && job.status === "completed" && job.resultSaved,
+    canRegenerate: !isTotpRotationBlocked(job) && !isEmailChangeBlocked(job) && job.status === "completed" && job.resultSaved,
     canForceRelogin: canForceRelogin(job),
     canSetupTotp: canSetupTotp(job),
     canAddPassword: canAddPassword(job),
@@ -3694,8 +4185,8 @@ function publicSelectionJob(job) {
     accountType: effectiveAccountType(job),
     status: job.status,
     canDownload: Boolean(job.resultSaved),
-    canRetry: !isLogoutRunning(job) && !isTotpRotationBlocked(job) && ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
-    canRegenerate: !isTotpRotationBlocked(job) && job.status === "completed" && job.resultSaved,
+    canRetry: !isLogoutRunning(job) && !isTotpRotationBlocked(job) && !isEmailChangeBlocked(job) && ["failed", "canceled", "reauth_required", "resume_available"].includes(job.status),
+    canRegenerate: !isTotpRotationBlocked(job) && !isEmailChangeBlocked(job) && job.status === "completed" && job.resultSaved,
     canForceRelogin: canForceRelogin(job),
     canSetupTotp: canSetupTotp(job),
     canRotateTotp: canRotateTotp(job),
@@ -3705,6 +4196,7 @@ function publicSelectionJob(job) {
 }
 
 function canForceRelogin(job) {
+  if (isEmailChangeBlocked(job)) return false;
   if (isTotpRotationBlocked(job)) return false;
   if (isPasswordSetRunning(job)) return false;
   if (isLogoutRunning(job)) return false;
@@ -3712,6 +4204,7 @@ function canForceRelogin(job) {
 }
 
 function canSetupTotp(job) {
+  if (isEmailChangeBlocked(job)) return false;
   if (isTotpRotationBlocked(job)) return false;
   if (isPasswordSetRunning(job)) return false;
   if (isLogoutRunning(job)) return false;
@@ -3723,6 +4216,7 @@ function canSetupTotp(job) {
 }
 
 function canAddPassword(job) {
+  if (isEmailChangeBlocked(job)) return false;
   if (isTotpRotationBlocked(job)) return false;
   if (isPasswordSetRunning(job)) return false;
   if (isLogoutRunning(job)) return false;
@@ -3916,6 +4410,7 @@ function resolveSelectedJobs(ids) {
 
 async function deleteJobsByEmail(email) {
   const matching = [...jobs.values()].filter((job) => job.email.toLowerCase() === email);
+  if (matching.some(isEmailChangeBlocked)) throw httpError(409, "请先完成或核实邮箱换绑，再删除账号");
   if (matching.some(isTotpRotationRunning)) throw httpError(409, "2FA 更换尚未结束，请先等待结果或取消操作");
   if (matching.some(isLogoutRunning)) throw httpError(409, "登出操作尚未结束，请先等待结果或取消操作");
   if (matching.some(isPasswordSetRunning)) throw httpError(409, "统一密码设置尚未结束，请先等待结果或取消操作");
@@ -4036,6 +4531,7 @@ async function syncCompletedOutputs(force = false) {
           runMode: null,
           fallbackInProgress: false,
           ...restoredTotpSetupState(metadata, storedCredentials),
+          ...restoredEmailChangeFields(metadata),
           annotations: restoreAnnotations(metadata.account_annotations),
           observedAccountType: observedAccountType(account),
           ...restoredProxyRiskState(metadata),
@@ -4134,6 +4630,7 @@ async function syncCompletedOutputs(force = false) {
           runMode: null,
           fallbackInProgress: false,
           ...restoredTotpSetupState(metadata, storedCredentials),
+          ...restoredEmailChangeFields(metadata),
           annotations: restoreAnnotations(metadata.account_annotations),
           observedAccountType: restoredObservedAccountType(metadata),
           ...restoredProxyRiskState(metadata),
@@ -4162,7 +4659,7 @@ async function syncCompletedOutputs(force = false) {
         const storedCredentialsMissing = missingStoredCredentials.length > 0;
         const savedStatus = String(metadata.status || "");
         const restartable = ["queued", "starting"].includes(savedStatus)
-          && !metadata.auto_repair_paused && !["logout_all", "password_set", "totp_rotate"].includes(metadata.queued_mode);
+          && !metadata.auto_repair_paused && !["logout_all", "password_set", "totp_rotate", "email_change", "email_change_verify"].includes(metadata.queued_mode);
         const interrupted = Boolean(savedStatus) && !isTerminalStatus(savedStatus) && !restartable;
         const restoredStatus = storedCredentialsMissing && restartable
           ? "reauth_required"
@@ -4234,6 +4731,7 @@ async function syncCompletedOutputs(force = false) {
             : "正在建立登录会话",
           fallbackInProgress: false,
           ...restoredTotpSetupState(metadata, storedCredentials),
+          ...restoredEmailChangeFields(metadata),
           annotations: restoreAnnotations(metadata.account_annotations),
           observedAccountType: restoredObservedAccountType(metadata),
           ...restoredProxyRiskState(metadata),
@@ -4486,6 +4984,12 @@ function restoredCredentialFlags(metadata = {}, credentials = {}) {
       || (hasExplicitTotpFlag ? metadata.has_totp_key : metadata.has_stored_credentials),
     ),
   };
+}
+
+function restoredEmailChangeFields(metadata) {
+  return { emailChange: metadata.email_change || null, emailChangeError: metadata.email_change?.error || null,
+    emailHistory: Array.isArray(metadata.email_history) ? metadata.email_history.filter(isEmail) : [],
+    mailRequestMethod: metadata.mail_request_method === "GET" ? "GET" : null };
 }
 
 function restoredTotpSetupState(metadata = {}, credentials = {}) {
@@ -5000,6 +5504,7 @@ function escapeRegExp(value) {
 }
 
 async function updateJobCredentials(job, credentials, options = {}) {
+  if (isEmailChangeBlocked(job)) throw httpError(409, "请先完成或核实邮箱换绑，再修改账号资料");
   if (isTotpRotationRunning(job)) throw httpError(409, "2FA 更换进行中，暂不能更新账号资料");
   if (isPasswordSetRunning(job)) throw httpError(409, "统一密码设置进行中，暂不能更新账号资料");
   if (isLogoutRunning(job)) throw httpError(409, "登出操作进行中，暂不能更新账号资料");
@@ -5029,6 +5534,7 @@ async function updateJobCredentials(job, credentials, options = {}) {
   job.loginMode = normalized.loginMode;
   job.mailApiUrl = normalized.mailApiUrl;
   job.mailRequestBody = normalized.mailRequestBody;
+  if (normalized.mailRequestBody) job.mailRequestMethod = null;
   job.password = normalized.password;
   job.totpSecret = normalized.totpSecret;
   job.hasPasswordCredential = Boolean(normalized.password);
@@ -5049,6 +5555,7 @@ async function updateJobCredentials(job, credentials, options = {}) {
 }
 
 async function updateJobProxy(job, proxyUrl) {
+  if (isEmailChangeBlocked(job)) throw httpError(409, "请先完成或核实邮箱换绑，再修改代理");
   if (isTotpRotationBlocked(job)) throw httpError(409, "请先等待或核实 2FA 更换结果");
   if (isPasswordSetRunning(job)) throw httpError(409, "统一密码设置进行中，暂不能更新代理配置");
   if (isLogoutRunning(job)) throw httpError(409, "登出操作进行中，暂不能更新代理配置");
@@ -5106,6 +5613,9 @@ async function saveJobMetadata(job) {
         version: 1,
         email: job.email,
         account_annotations: restoreAnnotations(job.annotations),
+        email_history: job.emailHistory || [],
+        email_change: job.emailChange || null,
+        mail_request_method: job.mailRequestMethod || null,
         observed_account_type: job.observedAccountType || "",
         status: job.status,
         prompt: job.prompt || null,
@@ -5216,7 +5726,8 @@ async function loadMailboxBaseline(job) {
 }
 
 async function beginMailPolling(job) {
-  if (!mailApiUrlForJob(job) || job.mailPollRunning || job.status !== "email_otp") return;
+  const expectedStage = job.status;
+  if (!mailApiUrlForJob(job) || job.mailPollRunning || !["email_otp", "email_change_otp"].includes(expectedStage)) return;
   job.mailPollRunning = true;
   job.mailStatus = "polling";
   job.mailApiError = null;
@@ -5228,7 +5739,7 @@ async function beginMailPolling(job) {
   try {
     while (
       job.mailPollToken === pollToken &&
-      job.status === "email_otp" &&
+      job.status === expectedStage &&
       job.child &&
       Date.now() - startedAt < MAIL_POLL_TIMEOUT_MS
     ) {
@@ -5239,7 +5750,7 @@ async function beginMailPolling(job) {
           }),
           job.mailOtpRequestedAt,
         );
-        if (job.mailPollToken !== pollToken || job.status !== "email_otp" || !job.child) return;
+        if (job.mailPollToken !== pollToken || job.status !== expectedStage || !job.child) return;
         const unseen = candidates.filter((candidate) => !job.mailSeenCandidateKeys.has(candidate.key));
         let fresh = unseen.find((candidate) => candidate.score >= 12);
         if (!fresh) {
@@ -5253,11 +5764,13 @@ async function beginMailPolling(job) {
           job.mailSeenCandidateKeys.add(fresh.key);
           job.mailCandidateCounts.delete(fresh.key);
           job.mailStatus = "found";
-          markAuthorizationRequirement(job, "emailOtp");
-          markAuthorizationAutomatic(job, "emailOtp");
+          if (expectedStage === "email_otp") {
+            markAuthorizationRequirement(job, "emailOtp");
+            markAuthorizationAutomatic(job, "emailOtp");
+          }
           job.parserTail = "";
           appendJobLog(job, "[mail] 已从收码接口自动取得新验证码并提交。\n");
-          setStage(job, "working", "已自动获取邮箱验证码，正在验证");
+          setStage(job, "working", expectedStage === "email_change_otp" ? "已获取新邮箱验证码，正在确认换绑" : "已自动获取邮箱验证码，正在验证");
           job.child.stdin.write(`${fresh.code}\n`);
           return;
         }
@@ -5270,10 +5783,10 @@ async function beginMailPolling(job) {
       await delay(MAIL_POLL_INTERVAL_MS);
     }
 
-    if (job.mailPollToken === pollToken && job.status === "email_otp") {
+    if (job.mailPollToken === pollToken && job.status === expectedStage) {
       job.mailStatus = "timeout";
       job.mailApiError = "自动收码等待超时，请手动输入或重新发送";
-      job.prompt = "自动收码等待超时，请手动输入邮箱验证码";
+      job.prompt = expectedStage === "email_change_otp" ? "新邮箱自动收码超时，请手动输入新邮箱验证码" : "自动收码等待超时，请手动输入邮箱验证码";
       touch(job);
     }
   } finally {
@@ -5286,7 +5799,6 @@ async function beginMailPolling(job) {
 }
 
 function stopMailPolling(job) {
-  if (!job.mailApiUrl) return;
   job.mailPollToken = null;
   job.mailPollRunning = false;
   if (job.mailStatus === "polling") job.mailStatus = "stopped";
@@ -5336,6 +5848,7 @@ function normalizeMailRequestConfig(value) {
 }
 
 function mailRequestForJob(job) {
+  if ((["email_change", "email_change_verify"].includes(job.runMode) && job.emailChangeMailboxPhase) || job.mailRequestMethod === "GET") return { method: "GET", headers: {}, body: "" };
   return {
     method: mailRequestConfig.method,
     headers: mailRequestConfig.headers,
@@ -5344,6 +5857,8 @@ function mailRequestForJob(job) {
 }
 
 function mailApiUrlForJob(job) {
+  if (["email_change", "email_change_verify"].includes(job.runMode) && job.emailChangeMailboxPhase) return job.emailChangeAutoMailDisabled ? null : job.emailChangeTargetMailApiUrl;
+  if (job.mailRequestMethod === "GET") return job.mailApiUrl;
   return mailRequestConfig.method === "POST" && validateMailApiUrl(mailRequestConfig.url)
     ? mailRequestConfig.url
     : job.mailApiUrl;
@@ -5415,7 +5930,7 @@ async function shutdown() {
       ...sub2ApiRequestPromises,
       ...sub2ApiAutoRepairPromises,
     ].filter(Boolean));
-    const activeJobs = [...jobs.values()].filter((job) => isActive(job.status) || isLogoutRunning(job) || isPasswordSetRunning(job) || isTotpRotationRunning(job));
+    const activeJobs = [...jobs.values()].filter((job) => isActive(job.status) || isLogoutRunning(job) || isPasswordSetRunning(job) || isTotpRotationRunning(job) || isEmailChangeRunning(job));
     const childWaits = activeJobs
       .map((job) => job.child)
       .filter(Boolean)

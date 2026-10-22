@@ -31,6 +31,8 @@ export const ACCOUNT_STATUS_LABELS = {
   password_add_starting: "准备密码",
   password_set_starting: "设置密码",
   logout_starting: "准备登出",
+  email_change_starting: "检查换绑",
+  email_change_otp: "待新邮箱码",
 };
 const STATUS_VALUES = new Set(Object.keys(ACCOUNT_STATUS_LABELS));
 export const EMPTY_ANNOTATIONS = Object.freeze({ type: "", group: "", tags: [], note: "" });

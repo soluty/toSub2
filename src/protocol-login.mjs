@@ -7,6 +7,7 @@ import { stdin as input, stdout as output } from "node:process";
 import { getLogoutSession, logoutAllDevices, readLogoutResult, writeLogoutResult } from "./account-security.mjs";
 import { setAccountPassword, formatPasswordSetError } from "./password-set.mjs";
 import { rotateAccountTotp } from "./totp-rotate.mjs";
+import { changeAccountEmail, confirmEmailChange, readEmailChangeIdentity, readEmailChangeState } from "./email-change.mjs";
 import { validateAccountPassword } from "./password-policy.mjs";
 import { describeTlsHandshakeFailure } from "./connection-errors.mjs";
 import {
@@ -337,6 +338,10 @@ async function run() {
       return;
     }
     await transport.prepareProxy(proxyTemplate, `${chatgptBase}/`);
+    if (args.changeEmail || args.verifyEmailChange) {
+      await runEmailChange(args, { chatgptBase, authBase, transport });
+      return;
+    }
     if (args.rotateTotp) {
       await runTotpRotation(args, { chatgptBase, authBase, transport });
       return;
@@ -594,6 +599,7 @@ async function run() {
         rl,
         password: process.env.CHATGPT_LOGIN_PASSWORD || "",
         totpSecret: process.env.CHATGPT_TOTP_SECRET || "",
+        existingAccountOnly: Boolean(args.existingAccountOnly),
       });
       console.log(
         client.jar.has("__Secure-next-auth.session-token")
@@ -664,6 +670,11 @@ async function run() {
         transport,
         cookie: client.jar.headerFor(authBase),
       });
+      if (args.existingAccountOnly && (sub2apiExport.account.credentials.email?.toLowerCase() !== email.toLowerCase()
+        || (process.env.CHATGPT_EMAIL_CHANGE_EXPECTED_USER_ID
+          && sub2apiExport.account.extra.chatgpt_user_id !== process.env.CHATGPT_EMAIL_CHANGE_EXPECTED_USER_ID))) {
+        throw new Error("EMAIL_CHANGE_AUTH_IDENTITY_MISMATCH: 新授权身份与换绑后的账号不一致，未保存授权文件");
+      }
       await writeJsonAtomic(sub2apiOutPath, sub2apiExport.data);
       await removeProtocolCheckpoint(checkpointPath);
       console.log(`[ok] Saved sub2api import: ${sub2apiOutPath}`);
@@ -683,6 +694,61 @@ async function run() {
   } finally {
     await transport.close();
   }
+}
+
+async function runEmailChange(args, { chatgptBase, authBase, transport }) {
+  const jobId = process.env.CHATGPT_EMAIL_CHANGE_JOB_ID;
+  const operationId = process.env.CHATGPT_EMAIL_CHANGE_ID;
+  if (!args.emailChangeState || !jobId || !operationId) throw new Error("换绑邮箱缺少操作记录或编号");
+  const statePath = path.resolve(args.emailChangeState);
+  const state = await readEmailChangeState(statePath, jobId, operationId);
+  if (!state) throw new Error("换绑邮箱记录不可用");
+  const rl = readline.createInterface({ input, output });
+  let client, web, mailboxRound = 0;
+  const prepareMailbox = async () => {
+    console.log(`[email-change-mailbox-prepare] ${++mailboxRound}`);
+    if (await ask(rl, "") !== "ready") throw new Error("新邮箱收码准备已取消");
+  };
+  const login = async email => {
+    client = new ProtocolClient({ verbose: args.verbose, transport });
+    web = await loginChatgptWeb(client, {
+      chatgptBase, authBase, email, rl, password: process.env.CHATGPT_LOGIN_PASSWORD || "",
+      totpSecret: process.env.CHATGPT_TOTP_SECRET || "", existingAccountOnly: true,
+    });
+  };
+  try {
+    if (args.verifyEmailChange) {
+      console.log("[email-change-target-login] 正在通过新邮箱登录核实结果，本次不会重新提交换绑请求。");
+      await prepareMailbox();
+      await login(state.newEmail);
+      await confirmEmailChange({ statePath, jobId, operationId, readIdentity: () => readEmailChangeIdentity(client, chatgptBase) });
+    } else {
+      console.log("[email-change] 正在验证原账号，随后立即检查换绑资格。");
+      await login(state.oldEmail);
+      await changeAccountEmail(client, {
+        chatgptBase, statePath, jobId, operationId, deviceId: web.deviceId, prepareMailbox,
+        askCode: () => ask(rl, "New email OTP (6 digits, q=quit): "),
+        confirmIdentity: async () => {
+          try {
+            const current = await readEmailChangeIdentity(client, chatgptBase);
+            if (current.email === state.newEmail.toLowerCase()) return current;
+          } catch {}
+          console.log("[email-change-target-login] 平台已接受确认，正在重新登录新邮箱核对账号身份。");
+          await prepareMailbox();
+          await login(state.newEmail);
+          return readEmailChangeIdentity(client, chatgptBase);
+        },
+      });
+    }
+    if (args.checkpoint) {
+      try {
+        const save = createCheckpointWriter(path.resolve(args.checkpoint), { client, email: state.newEmail, chatgptBase, authBase, web });
+        await save("email_verified", {});
+      } catch { console.log("[email-change] 新邮箱身份已确认，登录检查点未保存，后续授权将重新登录。"); }
+    }
+  } catch (error) {
+    throw new Error(error.emailChangeMessage || "换绑邮箱的登录或身份核对未完成，请检查登录资料与平台验证要求");
+  } finally { rl.close(); }
 }
 
 async function runTotpRotation(args, { chatgptBase, authBase, transport }) {
@@ -1164,7 +1230,7 @@ async function askSetupTotpOtp(rl) {
   }
 }
 
-async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, password, totpSecret }) {
+async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, password, totpSecret, existingAccountOnly = false }) {
   await client.follow(`${chatgptBase}/`, { referer: `${chatgptBase}/` });
   await client.getJson("GET", `${chatgptBase}/api/auth/providers`, {
     referer: `${chatgptBase}/`,
@@ -1251,6 +1317,9 @@ async function loginChatgptWeb(client, { chatgptBase, authBase, email, rl, passw
     totpSecret,
     referer: authPage.finalUrl,
   });
+  if (existingAccountOnly && isAccountProfileRequired(authenticated)) {
+    throw new Error("EXISTING_ACCOUNT_REQUIRED: 该登录流程要求创建新账号资料，换绑流程已停止");
+  }
   authenticated = await completeAccountProfileIfNeeded(client, {
     authBase,
     deviceId,
@@ -2407,6 +2476,10 @@ function parseArgs(argv) {
     else if (item === "--web-only") args.webOnly = true;
     else if (item === "--setup-totp") args.setupTotp = true;
     else if (item === "--rotate-totp") args.rotateTotp = true;
+    else if (item === "--change-email") args.changeEmail = true;
+    else if (item === "--verify-email-change") args.verifyEmailChange = true;
+    else if (item === "--email-change-state") args.emailChangeState = argv[++i];
+    else if (item === "--existing-account-only") args.existingAccountOnly = true;
     else if (item === "--add-password") args.addPassword = true;
     else if (item === "--set-password") args.setPassword = true;
     else if (item === "--password-already-exists") args.passwordAlreadyExists = true;
@@ -2559,6 +2632,10 @@ Options:
   --logout-operation-id <id>      登出操作唯一编号，防止同一次请求自动重放。
   --setup-totp                    Sign in and set up TOTP 2FA; skip Codex OAuth.
   --rotate-totp                   验证原 2FA，关闭后重新启用并保存新密钥。
+  --change-email                  验证原账号并检查资格，随后验证新邮箱并换绑。
+  --verify-email-change           只通过新邮箱登录核实已有操作，不重新提交换绑。
+  --email-change-state <file>     私有换绑状态文件。
+  --existing-account-only         仅登录已有账号，不创建新账号资料。
   --totp-result <file>            Private 2FA setup result. Default: ${DEFAULT_TOTP_RESULT}
   --add-password                  Sign in and add a password to a passwordless account.
   --set-password                  使用 CHATGPT_NEW_PASSWORD 为账号添加或修改密码。
@@ -2597,7 +2674,7 @@ Notes:
 }
 
 run().catch((error) => {
-  if (isProxyRiskControlError(error) && !process.argv.includes("--logout-all-devices") && !process.argv.includes("--set-password") && !process.argv.includes("--rotate-totp")) {
+  if (isProxyRiskControlError(error) && !["--logout-all-devices", "--set-password", "--rotate-totp", "--change-email", "--verify-email-change", "--existing-account-only"].some(flag => process.argv.includes(flag))) {
     console.error(`[proxy-risk-retry] ${String(error.message || "Proxy security check").slice(0, 320)}`);
   } else {
     console.error(`[error] ${describeTlsHandshakeFailure(error) || error.message}`);

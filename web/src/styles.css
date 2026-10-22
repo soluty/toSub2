@@ -1006,6 +1006,13 @@ tbody tr:last-child td { border-bottom: 0; }
 .annotation-dialog:not([open]) { display: none; }
 .annotation-dialog::backdrop { background: rgba(22, 31, 28, .42); }
 .annotation-dialog-description { margin: 17px 0; color: #67776d; font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.email-change-eligibility { display: flex; align-items: flex-start; gap: 9px; margin: 0 0 18px; padding: 12px; border: 1px solid #d6e6de; border-radius: 7px; background: #f2f8f5; color: #355b49; font-size: 12px; }
+.email-change-eligibility > svg { flex-shrink: 0; margin-top: 1px; }
+.email-change-eligibility p { margin: 5px 0 0; line-height: 1.65; }
+.email-change-sync { display: flex; align-items: center; gap: 8px; margin-top: 18px; font-size: 12px; }
+.email-change-sync input { accent-color: var(--green); }
+.email-change-target { margin-top: 6px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.email-change-dialog .dialog-footer { flex-wrap: wrap; }
 .annotation-tag-mode { display: flex; align-items: center; gap: 10px; margin-top: 10px; color: #657569; font-size: 12px; }
 .annotation-tag-mode select { width: auto; flex: 1; }
 @media (max-width: 650px) {
