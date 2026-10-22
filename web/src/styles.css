@@ -976,7 +976,8 @@ tbody tr:last-child td { border-bottom: 0; }
 .account-type-badge.type-plus { color: #176b4c; border-color: #b9dfcc; background: #e9f6ed; }
 .account-type-badge.type-5x { color: #245f96; border-color: #bed8ec; background: #edf5fc; }
 .account-type-badge.type-team, .account-type-badge.type-team_5x { color: #896317; border-color: #e7d3a6; background: #fcf5e3; }
-.account-type-badge.type-20x { color: #8b3f58; border-color: #e6c3ce; background: #fbecf1; }
+.account-type-badge.type-10x { color: #675196; border-color: #d4c7e8; background: #f3eefb; }
+.account-type-badge.type-25x { color: #8b3f58; border-color: #e6c3ce; background: #fbecf1; }
 .account-type-badge.type-pro, .account-type-badge.type-enterprise { color: #4b5775; border-color: #cbd3e0; background: #eff2f8; }
 .account-type-badge.type-edu { color: #286f75; border-color: #b7dcdf; background: #ebf7f8; }
 .account-group-badge { display: inline-flex; align-items: center; gap: 4px; min-width: 0; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #6d7972; font-size: 11px; }

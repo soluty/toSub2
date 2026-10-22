@@ -3,7 +3,8 @@ export const ACCOUNT_TYPES = [
   { value: "5x", label: "5x" },
   { value: "team", label: "Team" },
   { value: "team_5x", label: "Team 5x" },
-  { value: "20x", label: "20x" },
+  { value: "10x", label: "10x（$200）" },
+  { value: "25x", label: "25x（$500）" },
   { value: "pro", label: "Pro" },
   { value: "free", label: "Free" },
   { value: "enterprise", label: "Enterprise" },
@@ -137,8 +138,9 @@ export function accountFacets(jobs) {
   return { total: jobs.length, groups: items(groups), tags: items(tags), types: Object.fromEntries(types), statuses: Object.fromEntries(statuses) };
 }
 
-// 只读取已有授权记录的套餐标识作为参考，不发起平台请求，也不把 Pro 推断成 5x / 20x。
+// 只读取已有授权记录的套餐标识作为参考，不发起平台请求，也不把泛称 Pro 推断成具体额度。
 // self_serve_business_prolite：2026-10-22 本机 11 个账号的授权记录，用户确认均为 Team 5x。
+// promax：2026-10-22 部署实例新增 3 个账号的授权记录，用户确认均为 $500 / 25x。
 export function observedAccountType(account) {
   const candidates = [account?.credentials?.chatgpt_plan_type, account?.extra?.chatgpt_plan_type];
   for (const token of [account?.credentials?.id_token, account?.credentials?.access_token]) {
@@ -148,11 +150,14 @@ export function observedAccountType(account) {
       candidates.push(payload?.["https://api.openai.com/auth"]?.chatgpt_plan_type);
     } catch {}
   }
+  let hasGenericPro = false;
   for (const value of candidates) {
     const type = typeof value === "string" ? value.toLowerCase() : "";
+    if (type === "promax") return "25x";
+    if (type === "pro") { hasGenericPro = true; continue; }
     if (type === "self_serve_business_prolite") return "team_5x";
     if (type === "business") return "team";
-    if (["plus", "team", "team_5x", "pro", "free", "enterprise", "edu"].includes(type)) return type;
+    if (["plus", "team", "team_5x", "10x", "25x", "free", "enterprise", "edu"].includes(type)) return type;
   }
-  return "";
+  return hasGenericPro ? "pro" : "";
 }

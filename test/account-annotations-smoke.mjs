@@ -6,6 +6,18 @@ import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { observedAccountType } from "../src/account-annotations.mjs";
+
+for (const source of ["credentials", "extra"]) {
+  assert.equal(observedAccountType({ [source]: { chatgpt_plan_type: "promax" } }), "25x");
+}
+const promaxToken = `e30.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_plan_type: "promax" } })).toString("base64url")}.test`;
+for (const tokenField of ["id_token", "access_token"]) {
+  assert.equal(observedAccountType({ credentials: { chatgpt_plan_type: "pro", [tokenField]: promaxToken } }), "25x",
+    "泛称 Pro 不能遮蔽令牌中的明确 promax 标识");
+}
+assert.equal(observedAccountType({ credentials: { chatgpt_plan_type: "pro", id_token: "invalid" } }), "pro");
+assert.equal(observedAccountType({ extra: { chatgpt_plan_type: "promax_unconfirmed" } }), "");
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const root = await fs.mkdtemp(path.join(os.tmpdir(), "tosub2-account-annotations-"));
@@ -22,7 +34,9 @@ try {
   await fixture("team", "business", { group: "团队账号", tags: ["协作"], note: "产品组共享工作区" });
   await fixture("team-five", "self_serve_business_prolite", { group: "团队账号" });
   await fixture("reauth-team", "self_serve_business_prolite", { group: "团队账号", tags: ["待处理"], note: "等待重新授权" }, "output", "reauth_required");
-  await fixture("twenty", "pro", { type: "20x", group: "备用账号", tags: ["新入库", "高额度"], note: "10 月采购，待分配" });
+  await fixture("ten", "pro", { type: "10x", group: "备用账号" });
+  await fixture("twenty-five", "pro", { type: "25x", group: "备用账号", tags: ["新入库", "高额度"], note: "10 月采购，待分配" });
+  await fixture("promax", "promax", { group: "高额度账号" });
   await fixture("unmarked", "", {});
   if (!serving) {
     await fixture("pro", "pro", {});
@@ -30,6 +44,7 @@ try {
     for (let i = 0; i < 25; i++) await fixture(`paged-${i}`, "plus", { group: "跨页测试", tags: ["批次 A"], note: `续费批次 ${i}` });
     await fixture("checkpoint", "", { type: "team", group: "恢复测试", note: "检查点账号" }, "checkpoint");
     await fixture("checkpoint-team-five", "team_5x", {}, "checkpoint");
+    await fixture("checkpoint-promax", "25x", {}, "checkpoint");
     await fixture("unrecognized-team", "self_serve_business_unconfirmed", {});
     await fixture("metadata", "", { type: "free", group: "恢复测试", tags: ["历史"] }, "metadata");
     await fixture("invalid-metadata", "", { type: "not-a-plan", group: {}, tags: ["可恢复"], note: "保留有效字段" });
@@ -55,7 +70,20 @@ try {
     assert.equal((await annotate([teamFiveId], { type: "" })).status, 200);
     assert.equal((await getJob("team-five")).accountType, "team_5x");
     assert.equal((await query({ type: "team_5x" })).pagination.total, 3);
-    assert.equal((await getJob("pro")).accountType, "pro", "不能把 Pro 推断成 5x 或 20x");
+    assert.equal((await getJob("pro")).accountType, "pro", "不能把泛称 Pro 推断成具体额度");
+    assert.equal((await getJob("ten")).accountType, "10x");
+    assert.equal((await getJob("twenty-five")).accountType, "25x");
+    assert.equal((await getJob("promax")).accountType, "25x", "应识别授权记录中的 promax 标识");
+    assert.equal((await getJob("promax")).accountTypeSource, "authorization");
+    assert.equal((await getJob("checkpoint-promax")).accountType, "25x", "检查点应恢复规范化后的 25x 类型");
+    const promaxId = fixtures.get("promax").id;
+    assert.equal((await annotate([promaxId], { type: "10x" })).status, 200);
+    assert.equal((await getJob("promax")).accountType, "10x", "手动类型应优先于授权记录");
+    assert.equal((await annotate([promaxId], { type: "" })).status, 200);
+    assert.equal((await getJob("promax")).accountType, "25x");
+    assert.equal((await query({ type: "25x" })).pagination.total, 3);
+    assert.equal((await query({ type: "10x" })).pagination.total, 1);
+    assert.equal((await request("/api/jobs/query", { filters: { type: "20x" } })).status, 400);
     assert.equal((await getJob("unmarked")).accountType, "unknown");
     assert.equal((await getJob("invalid-metadata")).annotations.note, "保留有效字段");
     assert.equal((await getJob("invalid-metadata")).annotations.group, "");
@@ -104,7 +132,7 @@ try {
     assert.equal((await getJob("five")).accountType, "pro", "清空手动类型后沿用授权记录");
     assert.equal((await annotate([fiveId], { type: "5x" })).status, 200);
 
-    for (const invalid of [{ type: "unknown" }, { group: "x".repeat(61) }, { note: "x".repeat(1001) },
+    for (const invalid of [{ type: "unknown" }, { type: "20x" }, { group: "x".repeat(61) }, { note: "x".repeat(1001) },
       { tags: Array.from({ length: 13 }, (_, i) => String(i)) }, { tags: [12] }, { group: "a\nb" }, { typo: "标签" }]) {
       assert.equal((await annotate([plusId], invalid)).status, 400);
     }
@@ -112,9 +140,9 @@ try {
     assert.equal((await annotate([plusId], { tags: [] }, "bad-mode")).status, 400);
 
     const bulkIds = paged.selection.map(job => job.id);
-    const bulk = await annotate(bulkIds, { type: "20x", group: "批量已归档", tags: ["已核对"] }, "append");
+    const bulk = await annotate(bulkIds, { type: "25x", group: "批量已归档", tags: ["已核对"] }, "append");
     assert.equal((await bulk.json()).updated, 25);
-    const archived = await query({ group: "批量已归档", type: "20x", tag: "已核对" });
+    const archived = await query({ group: "批量已归档", type: "25x", tag: "已核对" });
     assert.equal(archived.pagination.total, 25);
     assert(archived.jobs.every(job => job.annotations.tags.includes("批次 A")));
     assert(!archived.facets.groups.some(group => group.value === "跨页测试"));
@@ -132,7 +160,7 @@ try {
 
     const importResponse = await request("/api/jobs/batch", { annotations: { group: "统一分组", tags: ["新入库"], note: "公共备注" }, text: [
       "import-legacy@example.com----Legacy_Password_927!",
-      JSON.stringify({ email: "import-json@example.com", password: 'Json_"Password_927!', annotations: { type: "5x", note: "单行备注" } }),
+      JSON.stringify({ email: "import-json@example.com", password: 'Json_"Password_927!', annotations: { type: "10x", note: "单行备注" } }),
       JSON.stringify({ email: "import-team@example.com", annotations: { type: "team", group: "行内分组", tags: [] } }),
       "{Brace_Password_927!----import-brace@example.com",
     ].join("\n") });
@@ -142,6 +170,7 @@ try {
     for (const job of imported.jobs) fixtures.set(job.email.split("@")[0], { id: job.id, directory: path.join(root, job.id) });
     assert.equal((await getJob("import-json")).annotations.group, "统一分组");
     assert.equal((await getJob("import-json")).annotations.note, "单行备注");
+    assert.equal((await getJob("import-json")).accountType, "10x");
     assert.equal((await getJob("import-team")).annotations.group, "行内分组");
     assert.deepEqual((await getJob("import-team")).annotations.tags, []);
     await until(async () => (await getJob("import-json")).status === "email_otp");
@@ -171,9 +200,14 @@ try {
     assert.equal((await getJob("team-five")).accountType, "team_5x");
     assert.equal((await getJob("team-five")).accountTypeSource, "authorization");
     assert.equal((await getJob("checkpoint-team-five")).accountType, "team_5x");
+    assert.equal((await getJob("promax")).accountType, "25x");
+    assert.equal((await getJob("promax")).accountTypeSource, "authorization");
+    assert.equal((await getJob("checkpoint-promax")).accountType, "25x");
+    assert.equal((await getJob("ten")).accountType, "10x");
     assert.equal((await query({ status: "reauth_required", group: "团队账号" })).pagination.total, 1);
     assert.equal((await getJob("metadata")).annotations.type, "free");
     assert.equal((await getJob("import-json")).annotations.note, "执行中也能修改备注");
+    assert.equal((await getJob("import-json")).accountType, "10x");
     assert.equal((await query({ group: "批量已归档" })).pagination.total, 25);
     const stored = JSON.parse(await fs.readFile(path.join(root, fiveId, "job-meta.json"), "utf8"));
     assert.equal(stored.account_annotations.type, "5x");

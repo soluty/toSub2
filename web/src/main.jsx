@@ -1766,7 +1766,7 @@ function EmailChangeDialog({ job, token, syncAvailable, onClose, onStarted }) {
       <p className="annotation-dialog-description">原邮箱：<strong>{job.email}</strong></p>
       <div className="email-change-eligibility">
         <ShieldCheck size={17} />
-        <div><strong>资格待检查</strong><p>Plus、Team、5x、20x 是套餐或本地类型标记，不能据此判断是否支持换绑。验证原账号后会先检查平台资格；不允许或无法确认时立即停止，不发送新邮箱验证码。</p></div>
+        <div><strong>资格待检查</strong><p>Plus、Team、5x、10x、25x 是套餐或本地类型标记，不能据此判断是否支持换绑。验证原账号后会先检查平台资格；不允许或无法确认时立即停止，不发送新邮箱验证码。</p></div>
       </div>
       <div className="annotation-fields">
         <div className="annotation-field annotation-field-wide">
