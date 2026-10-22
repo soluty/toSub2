@@ -1862,12 +1862,17 @@ function EmptyState({ filtered = false }) {
   );
 }
 
-function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, logoutAllAvailable, onEditAnnotations, onChangeEmail }) {
+export function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggleSelected, selectionSupported, smsProviderAvailable, smsProvider, onUpload, sub2apiUploadAvailable, totpSetupAvailable, passwordAddAvailable, forceReloginAvailable, accountProxyUrl, logoutAllAvailable, onEditAnnotations, onChangeEmail }) {
   const [value, setValue] = useState("");
+  const [inputError, setInputError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const logoutOperationId = useRef(null);
+  const inputErrorId = `job-input-error-${job.id}`;
 
-  useEffect(() => setValue(""), [job.status]);
+  useEffect(() => {
+    setValue("");
+    setInputError("");
+  }, [job.status]);
 
   async function continueEmailChange(action) {
     setSubmitting(true);
@@ -1879,16 +1884,23 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
   }
 
   async function sendInput(action, submittedValue = value) {
+    if (submitting) return;
+    const inputValue = action === "new_email_otp" ? submittedValue.trim() : submittedValue;
+    if (action === "new_email_otp" && !/^\d{6}$/.test(inputValue)) {
+      setInputError("新邮箱验证码必须是 6 位数字");
+      return;
+    }
+    setInputError("");
     setSubmitting(true);
     try {
       await apiFetch(token, `/api/jobs/${job.id}/input`, {
         method: "POST",
-        body: JSON.stringify({ action, value: submittedValue }),
+        body: JSON.stringify({ action, value: inputValue }),
       });
       setValue("");
       onError("");
     } catch (requestError) {
-      onError(requestError.message);
+      setInputError(requestError.message || "提交失败，请重试");
     } finally {
       setSubmitting(false);
     }
@@ -2126,14 +2138,23 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
               {inputConfig.icon}
               <input
                 value={value}
-                onChange={(event) => setValue(event.target.value)}
+                onChange={(event) => {
+                  setValue(event.target.value);
+                  setInputError("");
+                }}
                 onKeyDown={(event) => {
-                  if (event.key === "Enter" && value && !submitting) sendInput(inputConfig.action);
+                  if (event.key === "Enter" && value && !submitting) {
+                    event.preventDefault();
+                    sendInput(inputConfig.action);
+                  }
                 }}
                 inputMode={inputConfig.inputMode}
                 type={inputConfig.type || "text"}
                 placeholder={inputConfig.placeholder}
                 aria-label={inputConfig.placeholder}
+                aria-invalid={Boolean(inputError)}
+                aria-describedby={inputError ? inputErrorId : undefined}
+                disabled={submitting}
                 autoComplete={inputConfig.autoComplete || "one-time-code"}
               />
             </div>
@@ -2178,6 +2199,7 @@ function JobRow({ job, token, expanded, onToggleLogs, onError, selected, onToggl
             )}
           </div>
         )}
+        {inputConfig && inputError && <div id={inputErrorId} className="row-error" role="alert">{inputError}</div>}
       </td>
       <td className="time-cell"><time dateTime={job.createdAt}>{formatDateTime(job.createdAt)}</time></td>
       <td className="operation-time-cell">
